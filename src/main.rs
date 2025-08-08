@@ -1,5 +1,11 @@
-mod player;
+use bevy::prelude::*;
+
+mod simulation;
+use crate::simulation::GpuSimulationPlugin;
 
 fn main() {
-    println!("Hello, world!");
+    App::new()
+        .add_plugins((DefaultPlugins, GpuSimulationPlugin))
+        .insert_resource(ClearColor(Color::BLACK))
+        .run();
 }
