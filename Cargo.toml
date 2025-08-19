@@ -13,8 +13,4 @@ opt-level = 3
 
 
 [dependencies]
-bevy = { git = "https://github.com/bevyengine/bevy", features = [
-    "dynamic_linking",
-] }
-bytemuck = "1.23.1"
-rand = "0.9.2"
+wre = { version = "0.1.0", path = "../wre" }

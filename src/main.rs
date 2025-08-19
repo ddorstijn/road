@@ -1,11 +1,5 @@
-use bevy::prelude::*;
-
-mod simulation;
-use crate::simulation::GpuSimulationPlugin;
+use wre::WreApp;
 
 fn main() {
-    App::new()
-        .add_plugins((DefaultPlugins, GpuSimulationPlugin))
-        .insert_resource(ClearColor(Color::BLACK))
-        .run();
+    let app = WreApp::new();
 }
