@@ -1,5 +1,7 @@
-use wre::WreApp;
+use wre::ApplicationBuilder;
+
+struct RoadApp;
 
 fn main() {
-    let app = WreApp::new();
+    ApplicationBuilder::new(RoadApp).run().unwrap();
 }
