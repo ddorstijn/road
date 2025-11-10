@@ -11,6 +11,7 @@ use winit::window::{WindowAttributes, WindowId};
 
 use crate::vulkan_engine::VulkanEngine;
 
+pub(crate) mod vk_type;
 pub(crate) mod vk_util;
 mod vulkan_engine;
 

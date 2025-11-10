@@ -1,6 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
-use crate::vk_util::{image_subresource_range, transition_image};
+use crate::{
+    vk_type::AllocatedImage,
+    vk_util::{image_subresource_range, transition_image},
+};
 use vulkanalia::{
     Version,
     vk::{self, DeviceV1_0, DeviceV1_3, Handle, HasBuilder, KhrSwapchainExtensionDeviceCommands},
@@ -9,7 +12,7 @@ use vulkanalia_bootstrap::{
     Device, DeviceBuilder, Instance, InstanceBuilder, PhysicalDeviceSelector, PreferredDeviceType,
     QueueType, Swapchain, SwapchainBuilder,
 };
-use vulkanalia_vma::{self as vma};
+use vulkanalia_vma::{self as vma, Alloc};
 use winit::{dpi::PhysicalSize, window::Window};
 
 #[derive(Debug)]
@@ -34,6 +37,7 @@ pub struct VulkanEngine {
     device: Arc<Device>,
     swapchain: Swapchain,
     render_images: Vec<RenderImage>,
+    draw_image: AllocatedImage,
     graphics_queue: vk::Queue,
 
     frames: Vec<FrameData>,
@@ -74,6 +78,55 @@ impl VulkanEngine {
             render_images.len(),
         )?;
 
+        //draw image size will match the window
+        let draw_image_format = vk::Format::R16G16B16A16_SFLOAT;
+        let draw_image_extent = vk::Extent3D::builder()
+            .width(window_width)
+            .height(window_height)
+            .depth(1)
+            .build();
+        let draw_image_usage = vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let draw_image_create_info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::_2D)
+            .format(draw_image_format)
+            .extent(draw_image_extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(draw_image_usage);
+
+        let allocation_options = vma::AllocationOptions::default();
+        let (draw_image, allocation) =
+            unsafe { vma_allocator.create_image(draw_image_create_info, &allocation_options) }
+                .unwrap();
+        let draw_image_view_create_info = vk::ImageViewCreateInfo::builder()
+            .view_type(vk::ImageViewType::_2D)
+            .image(draw_image)
+            .format(draw_image_format)
+            .subresource_range(
+                vk::ImageSubresourceRange::builder()
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1)
+                    .aspect_mask(vk::ImageAspectFlags::COLOR),
+            );
+
+        let draw_image_view =
+            unsafe { device.create_image_view(&draw_image_view_create_info, None) }?;
+
+        let draw_image = AllocatedImage {
+            image_format: draw_image_format,
+            image_extent: draw_image_extent,
+            image_view: draw_image_view,
+            image: draw_image,
+            allocation,
+        };
+
         Ok(Self {
             window,
             instance,
@@ -81,6 +134,7 @@ impl VulkanEngine {
             vma_allocator,
             swapchain,
             render_images,
+            draw_image,
             graphics_queue,
             frame_number: 0,
             frames,
