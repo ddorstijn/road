@@ -1,8 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{mem::ManuallyDrop, sync::Arc, time::Duration};
 
 use crate::{
     vk_type::AllocatedImage,
-    vk_util::{image_subresource_range, transition_image},
+    vk_util::{copy_image_to_image, image_subresource_range, transition_image},
 };
 use vulkanalia::{
     Version,
@@ -42,8 +42,7 @@ pub struct VulkanEngine {
 
     frames: Vec<FrameData>,
     frame_number: usize,
-
-    vma_allocator: vma::Allocator,
+    vma_allocator: ManuallyDrop<vma::Allocator>,
 }
 
 impl VulkanEngine {
@@ -131,7 +130,7 @@ impl VulkanEngine {
             window,
             instance,
             device,
-            vma_allocator,
+            vma_allocator: ManuallyDrop::new(vma_allocator),
             swapchain,
             render_images,
             draw_image,
@@ -179,6 +178,10 @@ impl VulkanEngine {
             }
 
             let current_image = &self.render_images[swapchain_image_index as usize];
+            let draw_extent = vk::Extent2D::builder()
+                .width(self.draw_image.image_extent.width)
+                .height(self.draw_image.image_extent.height)
+                .build();
             let cmd = current_frame.command_buffer;
 
             self.device
@@ -194,32 +197,46 @@ impl VulkanEngine {
             transition_image(
                 self.device.clone(),
                 cmd,
-                current_image.image,
+                self.draw_image.image,
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::GENERAL,
             );
 
-            let flash = (self.frame_number as f32 / 120f32).sin().abs();
-            let clear_value = vk::ClearColorValue {
-                float32: { [0.0f32, 0.0f32, flash, 1.0f32] },
-            };
+            self.draw_background(cmd);
 
-            let clear_range = image_subresource_range(vk::ImageAspectFlags::COLOR);
-
-            self.device.cmd_clear_color_image(
+            //transition the draw image and the swapchain image into their correct transfer layouts
+            transition_image(
+                self.device.clone(),
                 cmd,
-                current_image.image,
+                self.draw_image.image,
                 vk::ImageLayout::GENERAL,
-                &clear_value,
-                &[clear_range],
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             );
 
-            // Make the swapchain image into presentable mode
             transition_image(
                 self.device.clone(),
                 cmd,
                 current_image.image,
-                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+
+            // execute a copy from the draw image into the swapchain
+            copy_image_to_image(
+                self.device.clone(),
+                cmd,
+                self.draw_image.image,
+                current_image.image,
+                draw_extent,
+                self.swapchain.extent,
+            );
+
+            // set swapchain image layout to Present so we can show it on the screen
+            transition_image(
+                self.device.clone(),
+                cmd,
+                current_image.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageLayout::PRESENT_SRC_KHR,
             );
 
@@ -272,6 +289,27 @@ impl VulkanEngine {
         self.frame_number += 1;
 
         Ok(())
+    }
+
+    fn draw_background(&self, cmd: vk::CommandBuffer) {
+        //make a clear-color from frame number. This will flash with a 120 frame period.
+
+        let flash = (self.frame_number as f32 / 120f32).sin().abs();
+        let clear_value = vk::ClearColorValue {
+            float32: { [0.0f32, 0.0f32, flash, 1.0f32] },
+        };
+
+        let clear_range = image_subresource_range(vk::ImageAspectFlags::COLOR);
+
+        unsafe {
+            self.device.cmd_clear_color_image(
+                cmd,
+                self.draw_image.image,
+                vk::ImageLayout::GENERAL,
+                &clear_value,
+                &[clear_range],
+            );
+        }
     }
 
     // UTILITY
@@ -418,6 +456,14 @@ impl VulkanEngine {
 impl Drop for VulkanEngine {
     fn drop(&mut self) {
         unsafe { self.device.device_wait_idle().unwrap() };
+        unsafe {
+            self.vma_allocator
+                .destroy_image(self.draw_image.image, self.draw_image.allocation);
+        }
+        unsafe {
+            self.device
+                .destroy_image_view(self.draw_image.image_view, None);
+        }
 
         for frame in self.frames.iter_mut() {
             unsafe {
@@ -431,6 +477,10 @@ impl Drop for VulkanEngine {
         }
 
         self.destroy_swapchain();
+
+        unsafe {
+            ManuallyDrop::drop(&mut self.vma_allocator);
+        }
 
         // Cleanup and destroy swapchain/device/instance
         self.device.destroy();

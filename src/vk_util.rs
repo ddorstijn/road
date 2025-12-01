@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 
 use vulkanalia::vk::{self, DeviceV1_3, HasBuilder};
 use vulkanalia_bootstrap::Device;
@@ -40,5 +40,57 @@ pub fn transition_image(
 
     unsafe {
         device.cmd_pipeline_barrier2(cmd, &dep_info);
+    }
+}
+
+pub fn copy_image_to_image(
+    device: Arc<Device>,
+    cmd: vk::CommandBuffer,
+    source: vk::Image,
+    destination: vk::Image,
+    src_size: vk::Extent2D,
+    dst_size: vk::Extent2D,
+) {
+    let src_offset = vk::Offset3D::builder()
+        .x(src_size.width as _)
+        .y(src_size.height as _)
+        .z(1)
+        .build();
+
+    // FIX: Set base_array_layer to 0 and layer_count to 1
+    let src_subresource = vk::ImageSubresourceLayers::builder()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .base_array_layer(0)
+        .layer_count(1);
+
+    let dst_offset = vk::Offset3D::builder()
+        .x(dst_size.width as _)
+        .y(dst_size.height as _)
+        .z(1)
+        .build();
+
+    // FIX: Set base_array_layer to 0 and layer_count to 1
+    let dst_subresource = vk::ImageSubresourceLayers::builder()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .base_array_layer(0)
+        .layer_count(1);
+
+    let blit_regions = [vk::ImageBlit2::builder()
+        .src_offsets([vk::Offset3D::default(), src_offset])
+        .dst_offsets([vk::Offset3D::default(), dst_offset])
+        .src_subresource(src_subresource)
+        .dst_subresource(dst_subresource)];
+
+    // ... remainder of function ...
+    let blit_image_info = vk::BlitImageInfo2::builder()
+        .dst_image(destination)
+        .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_image(source)
+        .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .filter(vk::Filter::LINEAR)
+        .regions(&blit_regions);
+
+    unsafe {
+        device.cmd_blit_image2(cmd, &blit_image_info);
     }
 }
