@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.100"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-vulkanalia = "0.32.0"
-vulkanalia-bootstrap = "0.1.5"
-vulkanalia-vma = "0.6.0"
+vulkano = "0.35.2"
+vulkano-shaders = "0.35.0"
 winit = "0.30.12"
