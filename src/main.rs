@@ -1,9 +1,11 @@
+use imgui::Context;
+use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use std::{error::Error, sync::Arc};
 use vulkano::{
     Validated, Version, VulkanError, VulkanLibrary,
     command_buffer::{
-        AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage,
-        allocator::StandardCommandBufferAllocator,
+        AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage, RenderingAttachmentInfo,
+        RenderingInfo, allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
         DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator,
@@ -21,6 +23,7 @@ use vulkano::{
         PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo,
         graphics::viewport::Viewport, layout::PipelineDescriptorSetLayoutCreateInfo,
     },
+    render_pass::{AttachmentLoadOp, AttachmentStoreOp},
     swapchain::{
         Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo, acquire_next_image,
     },
@@ -28,10 +31,14 @@ use vulkano::{
 };
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{self, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
 };
+
+use crate::imgui_renderer::ImguiVulkanoRenderer;
+
+mod imgui_renderer;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -40,7 +47,14 @@ fn main() -> Result<(), impl Error> {
     event_loop.run_app(&mut app)
 }
 
+struct Gui {
+    context: imgui::Context,
+    platform: WinitPlatform,
+    renderer: imgui_renderer::ImguiVulkanoRenderer,
+}
+
 struct App {
+    gui: Option<Gui>,
     instance: Arc<Instance>,
     device: Arc<Device>,
     queue: Arc<Queue>,
@@ -147,6 +161,7 @@ impl App {
             descriptor_set_allocator,
             command_buffer_allocator,
             rcx: None,
+            gui: None,
         }
     }
 }
@@ -158,6 +173,7 @@ impl ApplicationHandler for App {
                 .create_window(Window::default_attributes())
                 .unwrap(),
         );
+
         let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
         let window_size = window.inner_size();
         let (swapchain, images) = {
@@ -193,6 +209,25 @@ impl ApplicationHandler for App {
         };
 
         let attachment_image_views = window_size_dependent_setup(&images);
+
+        let mut imgui = Context::create();
+        let mut platform = WinitPlatform::new(&mut imgui);
+        platform.attach_window(imgui.io_mut(), &window, HiDpiMode::Default);
+        let renderer = ImguiVulkanoRenderer::new(
+            self.device.clone(),
+            self.queue.clone(),
+            self.command_buffer_allocator.clone(),
+            self.descriptor_set_allocator.clone(),
+            self.memory_allocator.clone(),
+            &mut imgui,
+            swapchain.image_format(),
+        );
+
+        self.gui = Some(Gui {
+            context: imgui,
+            platform,
+            renderer,
+        });
 
         mod cs {
             vulkano_shaders::shader! {
@@ -268,10 +303,18 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
         let rcx = self.rcx.as_mut().unwrap();
+        if let Some(gui) = &mut self.gui {
+            let winit_event: event::Event<()> = winit::event::Event::WindowEvent {
+                window_id,
+                event: event.clone(),
+            };
+            gui.platform
+                .handle_event(gui.context.io_mut(), &rcx.window, &winit_event);
+        }
 
         match event {
             WindowEvent::CloseRequested => {
@@ -338,6 +381,8 @@ impl ApplicationHandler for App {
                     Err(e) => panic!("failed to acquire next image: {e}"),
                 };
 
+                let current_image = rcx.attachment_image_views[image_index as usize].clone();
+
                 if suboptimal {
                     rcx.recreate_swapchain = true;
                 }
@@ -353,6 +398,16 @@ impl ApplicationHandler for App {
                     [],
                 )
                 .unwrap();
+
+                let gui = self.gui.as_mut().unwrap();
+                gui.platform
+                    .prepare_frame(gui.context.io_mut(), &rcx.window)
+                    .unwrap();
+                let ui = gui.context.new_frame();
+
+                ui.show_demo_window(&mut true); // Draw your windows here!
+
+                let draw_data = gui.context.render();
 
                 let mut builder = AutoCommandBufferBuilder::primary(
                     self.command_buffer_allocator.clone(),
@@ -387,15 +442,26 @@ impl ApplicationHandler for App {
 
                 unsafe { builder.dispatch([dispatch_x, dispatch_y, 1]) }.unwrap();
 
-                let current_image = rcx.attachment_image_views[image_index as usize]
-                    .image()
-                    .clone();
                 builder
                     .blit_image(BlitImageInfo::images(
                         rcx.draw_image_view.image().clone(),
-                        current_image,
+                        current_image.image().clone(),
                     ))
                     .unwrap();
+
+                let mut attachment_info = RenderingAttachmentInfo::image_view(current_image);
+                attachment_info.load_op = AttachmentLoadOp::Load;
+                attachment_info.store_op = AttachmentStoreOp::Store;
+                builder
+                    .begin_rendering(RenderingInfo {
+                        color_attachments: vec![Some(attachment_info)],
+                        ..Default::default()
+                    })
+                    .unwrap();
+
+                gui.renderer.draw(&mut builder, draw_data);
+
+                builder.end_rendering().unwrap();
 
                 let command_buffer = builder.build().unwrap();
 
