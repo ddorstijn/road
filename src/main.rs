@@ -1,4 +1,4 @@
-use imgui::Context;
+use imgui::{Condition, Context};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use std::{error::Error, sync::Arc};
 use vulkano::{
@@ -40,6 +40,13 @@ use crate::imgui_renderer::ImguiVulkanoRenderer;
 
 mod imgui_renderer;
 
+mod cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        path: "assets/shaders/gradient.comp"
+    }
+}
+
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
     let mut app = App::new(&event_loop);
@@ -61,6 +68,7 @@ struct App {
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    push_constants: cs::constants,
     rcx: Option<RenderContext>,
 }
 
@@ -153,6 +161,16 @@ impl App {
             Default::default(),
         ));
 
+        // The `vulkano_shaders::shaders!` macro generates a struct with the correct representation of
+        // the push constants struct specified in the shader. Here we create an instance of the
+        // generated struct.
+        let push_constants = cs::constants {
+            data1: [1., 0., 0., 1.],
+            data2: [0., 0., 1., 1.],
+            data3: [0., 0., 0., 0.],
+            data4: [0., 0., 0., 0.],
+        };
+
         App {
             instance,
             device,
@@ -160,6 +178,7 @@ impl App {
             memory_allocator,
             descriptor_set_allocator,
             command_buffer_allocator,
+            push_constants,
             rcx: None,
             gui: None,
         }
@@ -228,13 +247,6 @@ impl ApplicationHandler for App {
             platform,
             renderer,
         });
-
-        mod cs {
-            vulkano_shaders::shader! {
-                ty: "compute",
-                path: "assets/shaders/gradient.comp"
-            }
-        }
 
         let pipeline = {
             let cs = cs::load(self.device.clone())
@@ -405,7 +417,19 @@ impl ApplicationHandler for App {
                     .unwrap();
                 let ui = gui.context.new_frame();
 
-                ui.show_demo_window(&mut true); // Draw your windows here!
+                ui.window("Hello world")
+                    .size([300.0, 100.0], Condition::FirstUseEver)
+                    .build(|| {
+                        ui.text("Hello world!");
+                        ui.input_float4("data1", &mut self.push_constants.data1)
+                            .build();
+                        ui.input_float4("data2", &mut self.push_constants.data2)
+                            .build();
+                        ui.input_float4("data3", &mut self.push_constants.data3)
+                            .build();
+                        ui.input_float4("data4", &mut self.push_constants.data4)
+                            .build();
+                    });
 
                 let draw_data = gui.context.render();
 
@@ -429,14 +453,13 @@ impl ApplicationHandler for App {
                         0,
                         set,
                     )
+                    .unwrap()
+                    .push_constants(rcx.pipeline.layout().clone(), 0, self.push_constants)
                     .unwrap();
 
                 // Get the current dimensions of the drawing image
                 let [width, height, _] = rcx.draw_image_view.image().extent();
 
-                // Calculate how many workgroups are needed to cover the image.
-                // We assume the shader uses a local_size of 16x16.
-                // (width + 15) / 16 is integer math for ceil(width / 16.0)
                 let dispatch_x = (width + 15) / 16;
                 let dispatch_y = (height + 15) / 16;
 
