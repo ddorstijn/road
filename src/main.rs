@@ -1,9 +1,8 @@
 use std::{error::Error, sync::Arc};
 use vulkano::{
     Validated, Version, VulkanError, VulkanLibrary,
-    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        AutoCommandBufferBuilder, CommandBufferUsage, RenderingAttachmentInfo, RenderingInfo,
+        AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage,
         allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
@@ -13,28 +12,15 @@ use vulkano::{
         Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo,
         QueueFlags, physical::PhysicalDeviceType,
     },
-    image::{Image, ImageCreateFlags, ImageCreateInfo, ImageUsage, view::ImageView},
+    format::Format,
+    image::{Image, ImageCreateInfo, ImageUsage, view::ImageView},
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
-    memory::allocator::{
-        AllocationCreateInfo, GenericMemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator,
-    },
+    memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator},
     pipeline::{
-        ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint,
-        PipelineLayout, PipelineShaderStageCreateInfo,
-        compute::ComputePipelineCreateInfo,
-        graphics::{
-            GraphicsPipelineCreateInfo,
-            color_blend::{ColorBlendAttachmentState, ColorBlendState},
-            input_assembly::InputAssemblyState,
-            multisample::MultisampleState,
-            rasterization::RasterizationState,
-            subpass::PipelineRenderingCreateInfo,
-            vertex_input::{Vertex, VertexDefinition},
-            viewport::{Viewport, ViewportState},
-        },
-        layout::PipelineDescriptorSetLayoutCreateInfo,
+        ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+        PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo,
+        graphics::viewport::Viewport, layout::PipelineDescriptorSetLayoutCreateInfo,
     },
-    render_pass::{AttachmentLoadOp, AttachmentStoreOp},
     swapchain::{
         Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo, acquire_next_image,
     },
@@ -68,11 +54,11 @@ struct RenderContext {
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
     attachment_image_views: Vec<Arc<ImageView>>,
+    draw_image_view: Arc<ImageView>,
     pipeline: Arc<ComputePipeline>,
     viewport: Viewport,
     recreate_swapchain: bool,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
-    draw_image: Arc<Image>,
 }
 
 impl App {
@@ -194,7 +180,7 @@ impl ApplicationHandler for App {
                     min_image_count: surface_capabilities.min_image_count.max(2),
                     image_format,
                     image_extent: window_size.into(),
-                    image_usage: ImageUsage::COLOR_ATTACHMENT,
+                    image_usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST,
                     composite_alpha: surface_capabilities
                         .supported_composite_alpha
                         .into_iter()
@@ -245,17 +231,25 @@ impl ApplicationHandler for App {
         };
 
         let recreate_swapchain = false;
+        let draw_image = {
+            let [width, height] = swapchain.image_extent();
+            Image::new(
+                self.memory_allocator.clone(),
+                ImageCreateInfo {
+                    extent: [width, height, 1],
+                    format: Format::R16G16B16A16_SFLOAT,
+                    usage: ImageUsage::TRANSFER_SRC
+                        | ImageUsage::TRANSFER_DST
+                        | ImageUsage::STORAGE
+                        | ImageUsage::COLOR_ATTACHMENT,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .unwrap()
+        };
 
-        let draw_image = Image::new(
-            self.memory_allocator.clone(),
-            ImageCreateInfo {
-                extent: [window_size.width, window_size.height, 1],
-                array_layers: 1,
-                image_type: vulkano::image::ImageType::Dim1ds..Default::default(),
-            },
-            AllocationCreateInfo::default(),
-        )
-        .unwrap();
+        let draw_image_view = ImageView::new_default(draw_image).unwrap();
 
         let previous_frame_end = Some(sync::now(self.device.clone()).boxed());
 
@@ -267,7 +261,7 @@ impl ApplicationHandler for App {
             viewport,
             recreate_swapchain,
             previous_frame_end,
-            draw_image,
+            draw_image_view,
         });
     }
 
@@ -304,6 +298,26 @@ impl ApplicationHandler for App {
                         })
                         .expect("failed to recreate swapchain");
 
+                    let draw_image = {
+                        let [width, height] = new_swapchain.image_extent();
+                        Image::new(
+                            self.memory_allocator.clone(),
+                            ImageCreateInfo {
+                                extent: [width, height, 1],
+                                format: Format::R16G16B16A16_SFLOAT,
+                                usage: ImageUsage::TRANSFER_SRC
+                                    | ImageUsage::TRANSFER_DST
+                                    | ImageUsage::STORAGE
+                                    | ImageUsage::COLOR_ATTACHMENT,
+                                ..Default::default()
+                            },
+                            AllocationCreateInfo::default(),
+                        )
+                        .unwrap()
+                    };
+
+                    rcx.draw_image_view = ImageView::new_default(draw_image).unwrap();
+
                     rcx.swapchain = new_swapchain;
                     rcx.attachment_image_views = window_size_dependent_setup(&new_images);
                     rcx.viewport.extent = window_size.into();
@@ -330,9 +344,12 @@ impl ApplicationHandler for App {
 
                 let layout = &rcx.pipeline.layout().set_layouts()[0];
                 let set = DescriptorSet::new(
-                    self.descriptor_set_allocator,
+                    self.descriptor_set_allocator.clone(),
                     layout.clone(),
-                    [WriteDescriptorSet::image_view(0, data_buffer.clone())],
+                    [WriteDescriptorSet::image_view(
+                        0,
+                        rcx.draw_image_view.clone(),
+                    )],
                     [],
                 )
                 .unwrap();
@@ -351,12 +368,34 @@ impl ApplicationHandler for App {
                 builder
                     .bind_pipeline_compute(rcx.pipeline.clone())
                     .unwrap()
-                    .bind_descriptor_sets(PipelineBindPoint::Compute, layout, 0, set)
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Compute,
+                        rcx.pipeline.layout().clone(),
+                        0,
+                        set,
+                    )
                     .unwrap();
 
-                unsafe { builder.dispatch([16, 16, 1]) }.unwrap();
+                // Get the current dimensions of the drawing image
+                let [width, height, _] = rcx.draw_image_view.image().extent();
 
-                builder.end_rendering().unwrap();
+                // Calculate how many workgroups are needed to cover the image.
+                // We assume the shader uses a local_size of 16x16.
+                // (width + 15) / 16 is integer math for ceil(width / 16.0)
+                let dispatch_x = (width + 15) / 16;
+                let dispatch_y = (height + 15) / 16;
+
+                unsafe { builder.dispatch([dispatch_x, dispatch_y, 1]) }.unwrap();
+
+                let current_image = rcx.attachment_image_views[image_index as usize]
+                    .image()
+                    .clone();
+                builder
+                    .blit_image(BlitImageInfo::images(
+                        rcx.draw_image_view.image().clone(),
+                        current_image,
+                    ))
+                    .unwrap();
 
                 let command_buffer = builder.build().unwrap();
 
@@ -398,13 +437,6 @@ impl ApplicationHandler for App {
         let rcx = self.rcx.as_mut().unwrap();
         rcx.window.request_redraw();
     }
-}
-
-#[derive(BufferContents, Vertex)]
-#[repr(C)]
-struct MyVertex {
-    #[format(R32G32_SFLOAT)]
-    position: [f32; 2],
 }
 
 fn window_size_dependent_setup(images: &[Arc<Image>]) -> Vec<Arc<ImageView>> {
