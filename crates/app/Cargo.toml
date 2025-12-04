@@ -1,0 +1,10 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+engine = { path = "../engine" }
+imgui = { workspace = true }
+vulkano = { workspace = true }
+vulkano-shaders = { workspace = true }

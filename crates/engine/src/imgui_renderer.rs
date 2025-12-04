@@ -8,8 +8,11 @@ use vulkano::{
     },
     command_buffer::{
         AutoCommandBufferBuilder, PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract,
+        allocator::StandardCommandBufferAllocator,
     },
-    descriptor_set::{DescriptorSet, WriteDescriptorSet},
+    descriptor_set::{
+        DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator,
+    },
     device::{Device, Queue},
     format::Format,
     image::{
@@ -97,8 +100,7 @@ mod fs {
 
 pub struct ImguiVulkanoRenderer {
     pipeline: Arc<GraphicsPipeline>,
-    descriptor_set_allocator:
-        Arc<vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator>,
+    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 
     vertex_allocator: SubbufferAllocator,
     index_allocator: SubbufferAllocator,
@@ -112,16 +114,12 @@ pub struct ImguiVulkanoRenderer {
 
 impl ImguiVulkanoRenderer {
     pub fn new(
+        imgui: &mut imgui::Context,
         device: Arc<Device>,
         queue: Arc<Queue>,
-        command_buffer_allocator: Arc<
-            vulkano::command_buffer::allocator::StandardCommandBufferAllocator,
-        >,
-        descriptor_set_allocator: Arc<
-            vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator,
-        >,
+        command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+        descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
         memory_allocator: Arc<StandardMemoryAllocator>,
-        imgui: &mut imgui::Context,
         output_format: Format,
     ) -> Self {
         let fonts = imgui.fonts();
@@ -141,7 +139,6 @@ impl ImguiVulkanoRenderer {
         )
         .unwrap();
 
-        // Use a temporary buffer for upload
         let upload_buffer = Buffer::from_iter(
             memory_allocator.clone(),
             BufferCreateInfo {
@@ -172,7 +169,6 @@ impl ImguiVulkanoRenderer {
         )
         .unwrap();
 
-        // Wait for upload to finish
         cbb.build()
             .unwrap()
             .execute(queue.clone())
@@ -194,7 +190,6 @@ impl ImguiVulkanoRenderer {
         )
         .unwrap();
 
-        // --- Create Pipeline ---
         let vs = vs::load(device.clone())
             .unwrap()
             .entry_point("main")
@@ -273,8 +268,6 @@ impl ImguiVulkanoRenderer {
         let mut textures = HashMap::new();
         textures.insert(font_texture_id, font_descriptor_set);
 
-        // --- Create Allocators ---
-        // [Improvement] Create dedicated subbuffer allocators for high-frequency dynamic data
         let vertex_allocator = SubbufferAllocator::new(
             memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -334,7 +327,6 @@ impl ImguiVulkanoRenderer {
             return;
         }
 
-        // 1. Fill Host Vectors
         self.vertex_buffer_host.clear();
         self.index_buffer_host.clear();
         self.vertex_buffer_host
@@ -354,15 +346,11 @@ impl ImguiVulkanoRenderer {
                 .extend_from_slice(draw_list.idx_buffer());
         }
 
-        // 2. Upload to GPU via SubbufferAllocator
-        // [Improvement] This is significantly faster than creating a new Buffer per frame.
-        // It uses a pre-allocated chunk of memory and just returns a slice.
         let vertex_subbuffer = self
             .vertex_allocator
             .allocate_slice(self.vertex_buffer_host.len() as u64)
             .expect("Failed to allocate vertex buffer");
 
-        // Write data to the mapped memory
         {
             let mut buffer_content = vertex_subbuffer.write().unwrap();
             buffer_content.copy_from_slice(&self.vertex_buffer_host);
@@ -378,7 +366,6 @@ impl ImguiVulkanoRenderer {
             buffer_content.copy_from_slice(&self.index_buffer_host);
         }
 
-        // 3. Setup Pipeline State
         let [width, height] = draw_data.display_size;
         let [scale_w, scale_h] = draw_data.framebuffer_scale;
 
@@ -396,8 +383,6 @@ impl ImguiVulkanoRenderer {
             .push_constants(self.pipeline.layout().clone(), 0, push_consts)
             .unwrap();
 
-        // [Improvement] Set Viewport once per frame (ImGui logic usually assumes one large viewport
-        // and uses Scissors for windows).
         let fb_width = width * scale_w;
         let fb_height = height * scale_h;
 
@@ -477,7 +462,6 @@ impl ImguiVulkanoRenderer {
                             )
                             .unwrap();
 
-                        // [Improvement] Removed unsafe block.
                         unsafe {
                             builder
                                 .draw_indexed(
@@ -495,7 +479,7 @@ impl ImguiVulkanoRenderer {
                     _ => {}
                 }
             }
-            // Update vertex offset relative to the global buffer we created
+            // Update vertex offset relative to the global buffer
             vertex_offset += draw_list.vtx_buffer().len();
         }
     }
