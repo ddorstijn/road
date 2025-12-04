@@ -8,7 +8,7 @@
             "type": "lldb",
             "request": "launch",
             "name": "Launch",
-            "program": "${workspaceFolder}/target/debug/road-rs.exe",
+            "program": "${workspaceFolder}/target/debug/main.exe",
             "args": [],
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "rust: cargo build"

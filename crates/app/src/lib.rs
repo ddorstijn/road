@@ -26,10 +26,9 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         let push_constants = cs::constants {
-            data1: [1., 0., 0., 1.],
-            data2: [0., 0., 1., 1.],
-            data3: [0., 0., 0., 0.],
-            data4: [0., 0., 0., 0.],
+            start: [1., 0.],
+            end: [0., 0.],
+            radius: 0.1,
         };
 
         Self {
@@ -72,13 +71,9 @@ impl GameComponent for App {
             .size([300.0, 100.0], imgui::Condition::FirstUseEver)
             .build(|| {
                 ui.text("Hello world!");
-                ui.input_float4("data1", &mut self.push_constants.data1)
+                ui.input_float2("data1", &mut self.push_constants.start)
                     .build();
-                ui.input_float4("data2", &mut self.push_constants.data2)
-                    .build();
-                ui.input_float4("data3", &mut self.push_constants.data3)
-                    .build();
-                ui.input_float4("data4", &mut self.push_constants.data4)
+                ui.input_float2("data2", &mut self.push_constants.end)
                     .build();
             });
     }
