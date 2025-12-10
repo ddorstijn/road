@@ -1,5 +1,6 @@
 use crate::engine::VulkanContext;
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
+pub use imgui::Ui;
+pub use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 
 /// This mimics Unity's MonoBehaviour
 pub trait GameComponent {
@@ -8,7 +9,7 @@ pub trait GameComponent {
     fn start(&mut self, ctx: &VulkanContext);
 
     /// Called every frame for logic/UI (like Unity's OnGUI + Update)
-    fn ui(&mut self, ctx: &VulkanContext, ui: &mut imgui::Ui);
+    fn ui(&mut self, ctx: &VulkanContext, ui: &mut Ui);
 
     /// Called every frame to record Vulkan commands (like Unity's OnRenderObject)
     fn render(

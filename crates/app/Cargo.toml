@@ -8,3 +8,4 @@ engine = { path = "../engine" }
 imgui = { workspace = true }
 vulkano = { workspace = true }
 vulkano-shaders = { workspace = true }
+glam = { workspace = true }

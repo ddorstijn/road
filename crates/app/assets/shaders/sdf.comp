@@ -1,0 +1,148 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Output format: RGBA32f for high precision S-coordinates
+// R = Closest Distance (d)
+// G = Distance along road (s)
+// B = Road ID
+// A = Unused
+layout(rgba32f, set = 0, binding = 0) uniform writeonly image2D out_sdf;
+
+struct RoadSegment {
+    vec2 start;
+    float hdg;
+    float len;
+    float k0;
+    float k1;
+    float s_offset;
+    int road_id;
+};
+
+layout(std430, binding = 1) readonly buffer RoadDataBuffer {
+    RoadSegment segments[];
+};
+
+layout(push_constant) uniform PushConstants {
+    vec2 quad_origin; // World coordinates of the bottom-left of this quad
+    vec2 quad_size; // World dimensions of this quad
+} pc;
+
+// --- MATH HELPERS ---
+vec2 rotate(vec2 v, float a) {
+    float s = sin(a);
+    float c = cos(a);
+    return vec2(v.x * c - v.y * s, v.x * s + v.y * c);
+}
+
+vec2 toLocal(vec2 p, vec2 origin, float rotation) {
+    return rotate(p - origin, -rotation);
+}
+
+vec2 odrSpiral(float s, float cDot) {
+    float s2 = s * s;
+    float s3 = s2 * s;
+    float s4 = s2 * s2;
+    float s5 = s4 * s;
+    float a = 0.5 * cDot;
+    float a2 = a * a;
+    float x = s - (a2 * s5) * 0.1;
+    float y = (a * s3) * 0.333333 - (a2 * a * s4 * s3) * 0.023809;
+    return vec2(x, y);
+}
+
+// --- SDF FUNCTIONS ---
+vec2 sdLine(vec2 p, float L, vec2 origin, float rot, float s_offset) {
+    vec2 localP = toLocal(p, origin, rot);
+    vec2 pa = localP;
+    vec2 ba = vec2(L, 0.0);
+    float t = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return vec2(length(pa - ba * t), s_offset + t * L);
+}
+
+vec2 sdArc(vec2 p, float k, float L, vec2 origin, float rot, float s_offset) {
+    vec2 localP = toLocal(p, origin, rot);
+    float R = 1.0 / k;
+    vec2 center = vec2(0.0, R);
+    vec2 relP = localP - center;
+    vec2 polarP = (k > 0.0) ? vec2(-relP.y, relP.x) : vec2(relP.y, -relP.x);
+    float a = atan(polarP.y, polarP.x);
+    float totalA = L * abs(k);
+    float clampedA = clamp(a, 0.0, totalA);
+    vec2 closest = vec2(cos(clampedA), sin(clampedA)) * abs(R);
+    return vec2(length(polarP - closest), s_offset + clampedA / abs(k));
+}
+
+vec2 sdSpiral(vec2 p, float k0, float k1, float L, vec2 origin, float rot, float s_offset) {
+    vec2 localP = toLocal(p, origin, rot);
+    float cDot = (k1 - k0) / L;
+    float s_start = k0 / cDot;
+    float s_end = s_start + L;
+    vec2 p_virt = odrSpiral(s_start, cDot);
+    float theta = 0.5 * cDot * s_start * s_start;
+    mat2 rotMat = mat2(cos(theta), sin(theta), -sin(theta), cos(theta));
+    vec2 p_theo = p_virt + rotMat * localP;
+
+    float min_d = 1e10;
+    float local_s = 0.0;
+    int steps = 12;
+    float step_size = (s_end - s_start) / float(steps);
+    vec2 a = odrSpiral(s_start, cDot);
+
+    for (int i = 1; i <= steps; i++) {
+        float s_curr = s_start + float(i) * step_size;
+        vec2 b = odrSpiral(s_curr, cDot);
+        vec2 pa = p_theo - a;
+        vec2 ba = b - a;
+        float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+        float d_seg = length(pa - ba * h);
+        if (d_seg < min_d) {
+            min_d = d_seg;
+            local_s = (float(i - 1) + h) * step_size;
+        }
+        a = b;
+    }
+    return vec2(min_d, s_offset + local_s);
+}
+
+vec2 sdGeneralSegment(vec2 p, RoadSegment seg) {
+    float cDot = (seg.k1 - seg.k0) / seg.len;
+    if (abs(cDot) < 1e-6) {
+        if (abs(seg.k0) < 1e-6) {
+            return sdLine(p, seg.len, seg.start, seg.hdg, seg.s_offset);
+        } else {
+            return sdArc(p, seg.k0, seg.len, seg.start, seg.hdg, seg.s_offset);
+        }
+    }
+    return sdSpiral(p, seg.k0, seg.k1, seg.len, seg.start, seg.hdg, seg.s_offset);
+}
+
+void main() {
+    ivec2 texelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(out_sdf);
+
+    if (texelCoord.x >= size.x || texelCoord.y >= size.y) return;
+
+    // Map Pixel -> World Coordinates for this specific Quad
+    vec2 uv = vec2(texelCoord) / vec2(size);
+    vec2 p = pc.quad_origin + (uv * pc.quad_size);
+
+    float globalDist = 1e10;
+    float globalS = 0.0;
+    float closestRoadId = -1.0;
+
+    for (int i = 0; i < segments.length(); i++) {
+        RoadSegment seg = segments[i];
+        // Bounding box optimization
+        if (distance(p, seg.start) > seg.len + max(pc.quad_size.x, pc.quad_size.y)) continue;
+
+        vec2 res = sdGeneralSegment(p, seg);
+        if (res.x < globalDist) {
+            globalDist = res.x;
+            globalS = res.y;
+            closestRoadId = float(seg.road_id);
+        }
+    }
+
+    // Output Data: R=Dist, G=S, B=ID
+    imageStore(out_sdf, texelCoord, vec4(globalDist, globalS, closestRoadId, 1.0));
+}
