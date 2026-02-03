@@ -1,12 +1,11 @@
-use std::{mem::ManuallyDrop, sync::Arc, time::Duration};
+use std::{ffi::CStr, mem::ManuallyDrop, sync::Arc, time::Duration};
 
 use crate::{
     vk_type::AllocatedImage,
-    vk_util::{copy_image_to_image, image_subresource_range, transition_image},
+    vk_util::{copy_image_to_image, transition_image},
 };
 use vulkanalia::{
-    Version,
-    vk::{self, DeviceV1_0, DeviceV1_3, Handle, HasBuilder, KhrSwapchainExtensionDeviceCommands},
+    Version, bytecode::Bytecode, prelude::v1_4::*, vk::KhrSwapchainExtensionDeviceCommands,
 };
 use vulkanalia_bootstrap::{
     Device, DeviceBuilder, Instance, InstanceBuilder, PhysicalDeviceSelector, PreferredDeviceType,
@@ -31,6 +30,15 @@ struct RenderImage {
 }
 
 #[derive(Debug)]
+struct ComputePipeline {
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_set: vk::DescriptorSet,
+    descriptor_pool: vk::DescriptorPool,
+}
+
+#[derive(Debug)]
 pub struct VulkanEngine {
     pub window: Arc<Window>,
     instance: Arc<Instance>,
@@ -40,6 +48,7 @@ pub struct VulkanEngine {
     draw_image: AllocatedImage,
     graphics_queue: vk::Queue,
 
+    gradient_compute: ComputePipeline,
     frames: Vec<FrameData>,
     frame_number: usize,
     vma_allocator: ManuallyDrop<vma::Allocator>,
@@ -126,6 +135,8 @@ impl VulkanEngine {
             allocation,
         };
 
+        let gradient_compute = Self::create_gradient_compute_pipeline(device.clone(), &draw_image)?;
+
         Ok(Self {
             window,
             instance,
@@ -135,6 +146,7 @@ impl VulkanEngine {
             render_images,
             draw_image,
             graphics_queue,
+            gradient_compute,
             frame_number: 0,
             frames,
         })
@@ -292,27 +304,155 @@ impl VulkanEngine {
     }
 
     fn draw_background(&self, cmd: vk::CommandBuffer) {
-        //make a clear-color from frame number. This will flash with a 120 frame period.
+        self.draw_gradient(cmd);
+    }
 
-        let flash = (self.frame_number as f32 / 120f32).sin().abs();
-        let clear_value = vk::ClearColorValue {
-            float32: { [0.0f32, 0.0f32, flash, 1.0f32] },
-        };
-
-        let clear_range = image_subresource_range(vk::ImageAspectFlags::COLOR);
-
+    fn draw_gradient(&self, cmd: vk::CommandBuffer) {
         unsafe {
-            self.device.cmd_clear_color_image(
+            self.device.cmd_bind_pipeline(
                 cmd,
-                self.draw_image.image,
-                vk::ImageLayout::GENERAL,
-                &clear_value,
-                &[clear_range],
+                vk::PipelineBindPoint::COMPUTE,
+                self.gradient_compute.pipeline,
             );
+
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.gradient_compute.pipeline_layout,
+                0,
+                &[self.gradient_compute.descriptor_set],
+                &[],
+            );
+
+            // Calculate work groups needed for the image
+            let work_group_x = (self.draw_image.image_extent.width + 15) / 16;
+            let work_group_y = (self.draw_image.image_extent.height + 15) / 16;
+
+            self.device.cmd_dispatch(cmd, work_group_x, work_group_y, 1);
         }
     }
 
     // UTILITY
+
+    fn create_gradient_compute_pipeline(
+        device: Arc<Device>,
+        draw_image: &AllocatedImage,
+    ) -> anyhow::Result<ComputePipeline> {
+        let shader_module = {
+            let shader_content = include_bytes!("../assets/shaders/gradient.comp.spv");
+            let bytecode = Bytecode::new(&shader_content[..]).unwrap();
+            let info = vk::ShaderModuleCreateInfo::builder()
+                .code(bytecode.code())
+                .code_size(bytecode.code_size());
+
+            unsafe { device.create_shader_module(&info, None) }
+        }?;
+
+        // Create descriptor set layout for the storage image
+        let descriptor_set_layout_bindings = [vk::DescriptorSetLayoutBinding::builder()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .build()];
+
+        let descriptor_set_layout_create_info =
+            vk::DescriptorSetLayoutCreateInfo::builder().bindings(&descriptor_set_layout_bindings);
+
+        let descriptor_set_layout = unsafe {
+            device.create_descriptor_set_layout(&descriptor_set_layout_create_info, None)?
+        };
+
+        // Create descriptor pool
+        let descriptor_pool_sizes = [vk::DescriptorPoolSize::builder()
+            .type_(vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(1)
+            .build()];
+
+        let descriptor_pool_create_info = vk::DescriptorPoolCreateInfo::builder()
+            .max_sets(1)
+            .pool_sizes(&descriptor_pool_sizes);
+
+        let descriptor_pool =
+            unsafe { device.create_descriptor_pool(&descriptor_pool_create_info, None)? };
+
+        // Allocate descriptor set
+        let descriptor_set_layouts = [descriptor_set_layout];
+        let descriptor_set_allocate_info = vk::DescriptorSetAllocateInfo::builder()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&descriptor_set_layouts);
+
+        let descriptor_set = unsafe {
+            device
+                .allocate_descriptor_sets(&descriptor_set_allocate_info)?
+                .pop()
+                .ok_or(anyhow::anyhow!("No descriptor set allocated"))?
+        };
+
+        // Update descriptor set with the draw image
+        let image_info = [vk::DescriptorImageInfo::builder()
+            .image_view(draw_image.image_view)
+            .image_layout(vk::ImageLayout::GENERAL)
+            .build()];
+
+        let write_descriptor_set = vk::WriteDescriptorSet::builder()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(&image_info);
+
+        unsafe {
+            device
+                .update_descriptor_sets(&[*write_descriptor_set], &[] as &[vk::CopyDescriptorSet]);
+        }
+
+        // Create pipeline layout
+        let descriptor_set_layouts = [descriptor_set_layout];
+        let pipeline_layout_create_info =
+            vk::PipelineLayoutCreateInfo::builder().set_layouts(&descriptor_set_layouts);
+
+        let pipeline_layout =
+            unsafe { device.create_pipeline_layout(&pipeline_layout_create_info, None)? };
+
+        // Create compute pipeline
+        let entry_point = CStr::from_bytes_with_nul(b"main\0").unwrap();
+        let pipeline_stage_create_info = vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(entry_point.to_bytes_with_nul());
+
+        let pipeline_create_info = vk::ComputePipelineCreateInfo::builder()
+            .layout(pipeline_layout)
+            .stage(*pipeline_stage_create_info);
+
+        let pipeline = unsafe {
+            device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[*pipeline_create_info],
+                    None,
+                )?
+                .0
+                .pop()
+                .ok_or(anyhow::anyhow!("No pipeline created"))?
+        };
+
+        // Destroy shader module as it's no longer needed after pipeline creation
+        unsafe {
+            device.destroy_shader_module(shader_module, None);
+        }
+
+        Ok(ComputePipeline {
+            pipeline,
+            pipeline_layout,
+            descriptor_set_layout,
+            descriptor_set,
+            descriptor_pool,
+        })
+    }
+
+    // UTILITY (continued)
 
     fn setup_vulkan(window: Arc<Window>) -> anyhow::Result<(Arc<Instance>, Arc<Device>)> {
         let instance = InstanceBuilder::new(Some(window.clone()))
@@ -456,6 +596,19 @@ impl VulkanEngine {
 impl Drop for VulkanEngine {
     fn drop(&mut self) {
         unsafe { self.device.device_wait_idle().unwrap() };
+
+        // Cleanup compute pipeline
+        unsafe {
+            self.device
+                .destroy_descriptor_pool(self.gradient_compute.descriptor_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.gradient_compute.descriptor_set_layout, None);
+            self.device
+                .destroy_pipeline(self.gradient_compute.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.gradient_compute.pipeline_layout, None);
+        }
+
         unsafe {
             self.vma_allocator
                 .destroy_image(self.draw_image.image, self.draw_image.allocation);
