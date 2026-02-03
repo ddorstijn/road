@@ -1,20 +1,7 @@
-use crate::engine::VulkanContext;
 pub use imgui::Ui;
-pub use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
-
-/// This mimics Unity's MonoBehaviour
-pub trait GameComponent {
-    /// Called once when the Engine initializes (like Unity's Start)
-    /// Use this to load pipelines, shaders, and buffers.
-    fn start(&mut self, ctx: &VulkanContext);
-
-    /// Called every frame for logic/UI (like Unity's OnGUI + Update)
-    fn ui(&mut self, ctx: &VulkanContext, ui: &mut Ui);
-
-    /// Called every frame to record Vulkan commands (like Unity's OnRenderObject)
-    fn render(
-        &mut self,
-        ctx: &VulkanContext,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    );
+pub use vulkano_taskgraph::graph::TaskNodeBuilder;
+pub trait GameComponent: Send + Sync {
+    /// Called once to add this component's tasks to the graph.
+    /// Use this to define which Virtual IDs this task reads from or writes to.
+    fn add_to_graph(&self, builder: &mut TaskNodeBuilder, world: &TaskWorld);
 }

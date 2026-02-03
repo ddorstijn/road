@@ -246,6 +246,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "concurrent-slotmap"
+version = "0.1.0-alpha.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b986749ea6185190813567c2a78cab7d1fccab01589470a05ebc829afd85ae6c"
+dependencies = [
+ "virtual-buffer",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -357,6 +366,7 @@ dependencies = [
  "imgui-winit-support",
  "vulkano",
  "vulkano-shaders",
+ "vulkano-taskgraph",
  "winit",
 ]
 
@@ -1497,6 +1507,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "virtual-buffer"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b434093a2de01d3b27e6246b0ececca4cc2a77f046bef06a9dc1216e3d892a91"
+dependencies = [
+ "libc",
+ "windows-targets 0.52.6",
+]
+
+[[package]]
 name = "vk-parse"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1561,6 +1581,21 @@ dependencies = [
  "quote",
  "shaderc",
  "syn",
+ "vulkano",
+]
+
+[[package]]
+name = "vulkano-taskgraph"
+version = "0.35.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "316480b7b02d8a98a3965e4d2f21129e6f1749eb1e126db108daa8bede994957"
+dependencies = [
+ "ash",
+ "concurrent-slotmap",
+ "foldhash",
+ "parking_lot",
+ "smallvec",
+ "thread_local",
  "vulkano",
 ]
 

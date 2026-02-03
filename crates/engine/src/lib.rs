@@ -6,6 +6,7 @@ pub mod component;
 pub mod engine;
 mod imgui_renderer;
 mod vulkan_util;
+mod world;
 
 pub struct Engine {
     window_title: String,
