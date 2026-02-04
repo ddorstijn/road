@@ -83,28 +83,48 @@ impl PipelineBuilder {
     }
 }
 
-pub struct ResourceDef {
+#[derive(Debug)]
+pub struct BufferDef {
     pub name: String,
-    pub size_bytes: usize,
+    pub count: usize,
     pub usage: vk::BufferUsageFlags,
-    pub initializer: Option<Box<dyn FnOnce() -> Vec<u8>>>, // Returns raw bytes
+    pub initial_data: Option<Vec<u8>>,
 }
 
-impl std::fmt::Debug for ResourceDef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResourceDef")
-            .field("name", &self.name)
-            .field("size_bytes", &self.size_bytes)
-            .field("usage", &self.usage)
-            .field("initializer", &self.initializer.is_some())
-            .finish()
-    }
+// 1. Size (Same as before)
+#[derive(Clone, Copy, Debug)]
+pub enum TextureSize {
+    ViewportRelative(f32),
+    Fixed(u32, u32),
+    Native, // Only valid if path is Some(...)
+}
+
+// 2. The Flattened Config Struct
+pub struct TextureSource<'a> {
+    // If Some: Load this file.
+    // If None: Create an empty attachment.
+    pub path: Option<&'a str>,
+
+    pub format: vk::Format,
+    pub size: TextureSize,
+    pub usage: vk::ImageUsageFlags,
+}
+
+// 3. Internal Storage (Owned)
+#[derive(Debug)]
+pub(crate) struct TextureDef {
+    pub name: String,
+    pub path: Option<String>, // Owned string
+    pub format: vk::Format,
+    pub size: TextureSize,
+    pub usage: vk::ImageUsageFlags,
 }
 
 #[derive(Default, Debug)]
 pub struct RenderApp {
     // We store raw bytes for initialization to keep the App struct non-generic
-    resource_defs: Vec<ResourceDef>,
+    buffer_defs: Vec<BufferDef>,
+    texture_defs: Vec<TextureDef>,
     pipelines: Vec<PipelineDef>,
     vulkan_engine: Option<VulkanEngine>,
 }
@@ -122,38 +142,32 @@ impl RenderApp {
     pub fn add_buffer<T: Pod>(
         mut self,
         name: &str,
+        count: usize,
         usage: vk::BufferUsageFlags,
-        init_fn: fn() -> Vec<T>,
+        init_fn: Option<fn() -> Vec<T>>,
     ) -> Self {
-        self.resource_defs.push(ResourceDef::Buffer {
+        let initial_data = init_fn.map(|init| bytemuck::cast_slice(&init()).to_vec());
+
+        self.buffer_defs.push(BufferDef {
             name: name.to_string(),
+            count,
             usage,
-            initializer: Box::new(move || {
-                let data = init_fn();
-                bytemuck::cast_slice(&data).to_vec()
-            }),
+            initial_data,
         });
         self
     }
 
-    // Function 2: TEXTURES
-    // No generics needed! Clean and simple.
-    pub fn add_texture(
-        mut self,
-        name: &str,
-        format: vk::Format,
-        scale: f32, // Shortcut for relative sizing
-    ) -> Self {
-        self.resource_defs.push(ResourceDef::Texture {
+    pub fn add_texture(mut self, name: &str, source: TextureSource) -> Self {
+        self.texture_defs.push(TextureDef {
             name: name.to_string(),
-            format,
-            usage: vk::ImageUsageFlags::SAMPLED
-                | vk::ImageUsageFlags::COLOR_ATTACHMENT
-                | vk::ImageUsageFlags::STORAGE, // Reasonable defaults or explicit
-            scale,
+            path: source.path.map(|p| p.to_string()),
+            format: source.format,
+            size: source.size,
+            usage: source.usage,
         });
         self
     }
+
     pub fn add_pipeline(
         mut self,
         name: &str,
