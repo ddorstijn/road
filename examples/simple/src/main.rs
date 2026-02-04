@@ -1,30 +1,88 @@
-use vre::RenderApp;
-
+use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
+use vre::{
+    ComputePass, Pass, PipelineBuilder, PipelineConfig, RenderApp, RenderPass, TextureFormat,
+    TextureUsage,
+};
 
-struct PointBuffer {
+// --- 1. Struct Definitions (Shared with Shaders) ---
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct Ball {
     position: Vec2,
+    velocity: Vec2,
 }
 
-fn init_points() -> Vec<PointBuffer> {
-    (0..10)
-        .map(|p| PointBuffer {
-            position: Vec2::splat(p as f32),
-        })
-        .collect()
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct PhysicsParams {
+    dt: f32,
+    gravity: f32,
 }
 
-fn main() {
-    // Pseudo code of what the interface should somewhat look like
-    // Should we use register_buffer and register_texture or just register_resource?
-    // Is it possible to detect input and output buffers for the graph or explicitly specify resources used
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct DrawParams {
+    ball_size: f32,
+    blur_strength: f32,
+}
+
+// --- 2. Initialization Function ---
+// Returns the exact array of structs to upload
+fn create_balls() -> Vec<Ball> {
+    const COUNT: usize = 1000;
+    let mut balls = Vec::with_capacity(COUNT);
+
+    for i in 0..COUNT {
+        // Random-ish setup
+        let x = (i as f32 % 50.0) - 25.0;
+        let y = (i as f32 / 50.0) - 10.0;
+        balls.push(Ball {
+            position: Vec2::new(x, y),
+            velocity: Vec2::new(1.0, 5.0), // Start with some bounce
+        });
+    }
+    balls
+}
+
+fn main() -> anyhow::Result<()> {
     RenderApp::new()
-        .register_buffer::<PointBuffer>(init_points())
-        .add_node(vre::Pipeline::Compute, "assets/shaders/update_balls.comp")
-        .add_node(vre::Pipeline::Graphics, "assets/shaders/render_balls.frag");
+        // Resources
+        .add_buffer("Balls", vk::BufferUsageFlags::STORAGE_BUFFER, create_balls)
+        .add_texture(
+            "SceneColor",
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            1.0,
+        )
+        // --- PIPELINE: Render ---
+        .add_pipeline("Render", PipelineConfig::PerFrame, |pipeline| {
+            // 1. Render Pass
+            // The engine looks for "vs_main" and "fs_main" in "ball.wgsl"
+            pipeline.add_pass(RenderPass {
+                name: "DrawBalls",
+                shader: "assets/shaders/ball.wgsl",
+                inputs: &["Balls"],
+                outputs: &["SceneColor"],
+                constants: DrawParams {
+                    ball_size: 0.5,
+                    blur_strength: 0.0,
+                },
+            });
 
-    // What this code should do:
-    // Fill buffer with random points on the cpu
-    // Update points with compute shader
-    // Render points with fragment shader with radius constant
+            // 2. Compute Pass (Post-Process)
+            // The engine looks for "main" in "blur.wgsl"
+            pipeline.add_pass(ComputePass {
+                name: "MotionBlur",
+                shader: "assets/shaders/blur.wgsl",
+                inputs: &["SceneColor"],
+                outputs: &["$SWAPCHAIN"],
+                constants: DrawParams {
+                    ball_size: 0.0,
+                    blur_strength: 0.8,
+                },
+            });
+        })
+        .run()
 }

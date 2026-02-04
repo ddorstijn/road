@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use naga::{back::spv, front::wgsl};
 use vulkanalia::vk::{self, DeviceV1_3, HasBuilder};
 use vulkanalia_bootstrap::Device;
 
@@ -93,4 +94,26 @@ pub fn copy_image_to_image(
     unsafe {
         device.cmd_blit_image2(cmd, &blit_image_info);
     }
+}
+
+pub fn compile_wgsl(source: &str) -> Result<Vec<u32>, anyhow::Error> {
+    // 1. Parse WGSL
+    let module = wgsl::parse_str(source)?;
+
+    // 2. Validate (Checks types, bindings, etc.)
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)?;
+
+    // 3. Write SPIR-V
+    let mut options = spv::Options::default();
+    // Important: Vulkan 1.1+ conventions
+    options
+        .flags
+        .insert(spv::WriterFlags::ADJUST_COORDINATE_SPACE);
+
+    let binary = spv::write_vec(&module, &info, &options, None)?;
+    Ok(binary)
 }
