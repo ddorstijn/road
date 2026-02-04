@@ -339,7 +339,7 @@ impl VulkanEngine {
         draw_image: &AllocatedImage,
     ) -> anyhow::Result<ComputePipeline> {
         let shader_module = {
-            let shader_content = include_bytes!("../assets/shaders/gradient.comp.spv");
+            let shader_content = include_bytes!("../../../assets/shaders/gradient.comp.spv");
             let bytecode = Bytecode::new(&shader_content[..]).unwrap();
             let info = vk::ShaderModuleCreateInfo::builder()
                 .code(bytecode.code())

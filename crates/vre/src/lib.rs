@@ -16,11 +16,31 @@ pub(crate) mod vk_util;
 mod vulkan_engine;
 
 #[derive(Default, Debug)]
-struct App {
+pub struct RenderApp {
     vulkan_engine: Option<VulkanEngine>,
 }
 
-impl ApplicationHandler for App {
+impl RenderApp {
+    pub fn new() -> Self {
+        tracing_subscriber::registry()
+            .with(fmt::layer())
+            .with(EnvFilter::from_default_env())
+            .init();
+
+        Self {
+            vulkan_engine: None,
+        }
+    }
+
+    pub fn run(mut self) -> anyhow::Result<()> {
+        let event_loop = EventLoop::new()?;
+        event_loop.run_app(&mut self)?;
+
+        Ok(())
+    }
+}
+
+impl ApplicationHandler for RenderApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let init_vulkan = || -> anyhow::Result<VulkanEngine> {
             let window = Arc::new(event_loop.create_window(WindowAttributes::default())?);
@@ -54,18 +74,4 @@ impl ApplicationHandler for App {
             _ => (),
         }
     }
-}
-
-fn main() -> anyhow::Result<()> {
-    // Initialize a simple tracing subscriber so example logs are visible
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
-        .init();
-
-    let event_loop = EventLoop::new()?;
-    let mut app = App::default();
-    event_loop.run_app(&mut app)?;
-
-    Ok(())
 }

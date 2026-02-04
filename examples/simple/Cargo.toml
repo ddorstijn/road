@@ -1,0 +1,10 @@
+[package]
+name = "simple"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+bytemuck = "1.25"
+glam = "0.31.0"
+vre = { path = "../../crates/vre" }

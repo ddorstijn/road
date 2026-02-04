@@ -1,13 +1,7 @@
-[package]
-name = "road-rs"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = ["examples/*", "crates/*"]
+resolver = "2"
 
-[dependencies]
-anyhow = "1.0.100"
-bytemuck = "1.25"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-vulkanalia = "0.34.0"
-vulkanalia-bootstrap = "0.1.6"
-vulkanalia-vma = "0.8.0"
-winit = "0.30.12"
+[workspace.package]
+edition = "2021"
+keywords = ["vulkan", "bindings", "graphics", "gpu", "rendering"]
