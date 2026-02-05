@@ -13,13 +13,13 @@ use winit::window::{WindowAttributes, WindowId};
 
 use crate::vulkan_engine::VulkanEngine;
 
-use vulkanalia::vk;
+pub mod vk {
+    pub use vulkanalia::vk::{BufferUsageFlags, Format, ImageUsageFlags};
+}
 
 pub(crate) mod vk_type;
 pub(crate) mod vk_util;
 mod vulkan_engine;
-
-// --- Public Config ---
 
 #[derive(Debug)]
 pub enum PipelineConfig {
@@ -27,16 +27,12 @@ pub enum PipelineConfig {
     FixedTimestep(Duration),
 }
 
-// --- User-Facing Structs (Strict API) ---
-
-// 1. The Flag (Shared by User API and Internal logic)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PassType {
-    Render,  // Engine implies: "vs_main", "fs_main"
-    Compute, // Engine implies: "main"
+    Render,
+    Compute,
 }
 
-// 2. The Internal Representation (Flat Struct)
 #[derive(Debug)]
 pub(crate) struct PassDef {
     pub name: String,
@@ -49,7 +45,7 @@ pub(crate) struct PassDef {
 
 pub struct ShaderPass<'a, T: Pod> {
     pub name: &'a str,
-    pub ty: PassType, // <--- The differentiator
+    pub ty: PassType,
     pub shader: &'a str,
     pub inputs: &'a [&'a str],
     pub outputs: &'a [&'a str],
@@ -62,8 +58,6 @@ pub(crate) struct PipelineDef {
     pub config: PipelineConfig,
     pub passes: Vec<PassDef>,
 }
-
-// --- The Builder ---
 
 #[derive(Debug)]
 pub struct PipelineBuilder {
@@ -91,18 +85,14 @@ pub struct BufferDef {
     pub initial_data: Option<Vec<u8>>,
 }
 
-// 1. Size (Same as before)
 #[derive(Clone, Copy, Debug)]
 pub enum TextureSize {
     ViewportRelative(f32),
     Fixed(u32, u32),
-    Native, // Only valid if path is Some(...)
+    Native, // Only valid if path is set
 }
 
-// 2. The Flattened Config Struct
 pub struct TextureSource<'a> {
-    // If Some: Load this file.
-    // If None: Create an empty attachment.
     pub path: Option<&'a str>,
 
     pub format: vk::Format,
@@ -144,9 +134,9 @@ impl RenderApp {
         name: &str,
         count: usize,
         usage: vk::BufferUsageFlags,
-        init_fn: Option<fn() -> Vec<T>>,
+        init_fn: Option<fn(usize) -> Vec<T>>,
     ) -> Self {
-        let initial_data = init_fn.map(|init| bytemuck::cast_slice(&init()).to_vec());
+        let initial_data = init_fn.map(|init| bytemuck::cast_slice(&init(count)).to_vec());
 
         self.buffer_defs.push(BufferDef {
             name: name.to_string(),
