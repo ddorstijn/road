@@ -1,11 +1,13 @@
 [package]
-name = "vre"
+name = "engine"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
-bytemuck = "1.25"
+bytemuck = { version = "1.25", features = ["derive"] }
+glam = { version = "0.32.0", features = ["bytemuck"] }
+log = "0.4"
 naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 vulkanalia = "0.35.0"

@@ -1,10 +1,10 @@
 [package]
-name = "simple"
+name = "traffic"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
 bytemuck = { version = "1.25", features = ["derive"] }
-glam = { version = "0.32.0", features = ["bytemuck"] }
-vre = { path = "../../crates/vre" }
+engine = { path = "../../crates/engine" }
+log = "0.4"
