@@ -66,23 +66,25 @@ impl ReferenceLine {
         // Compute tangent directions between consecutive points
         let n = points.len();
         let mut tangents: Vec<Vec2> = Vec::with_capacity(n - 1);
+        let mut tangent_headings: Vec<f32> = Vec::with_capacity(n - 1);
         let mut lengths: Vec<f32> = Vec::with_capacity(n - 1);
         for i in 0..n - 1 {
             let d = points[i + 1].position - points[i].position;
             let l = d.length();
             lengths.push(l);
-            tangents.push(if l > 1e-6 { d / l } else { Vec2::X });
+            let t = if l > 1e-6 { d / l } else { Vec2::X };
+            tangents.push(t);
+            tangent_headings.push(t.y.atan2(t.x));
         }
 
-        // For each interior point, compute how much of the adjacent line segments
-        // is consumed by the arc+spiral transitions
+        // For each interior point, compute the turn geometry
         struct TurnInfo {
-            tangent_length: f32, // distance along tangent consumed (each side)
+            tangent_length: f32, // distance along tangent consumed on each side
             #[allow(dead_code)]
-            arc_angle: f32,
+            turn_angle: f32, // signed turn angle
             arc_length: f32,
             spiral_length: f32,
-            curvature: f32,
+            curvature: f32, // signed curvature
         }
 
         let mut turns: Vec<Option<TurnInfo>> = Vec::with_capacity(n);
@@ -98,36 +100,75 @@ impl ReferenceLine {
             let dir_in = tangents[i - 1];
             let dir_out = tangents[i];
 
-            // Angle between directions
-            let cos_a = dir_in.dot(dir_out).clamp(-1.0, 1.0);
-            let half_angle = ((1.0 - cos_a) / 2.0).sqrt().asin(); // half the turn angle
+            // Signed turn angle via atan2 of cross and dot
+            let cross = dir_in.x * dir_out.y - dir_in.y * dir_out.x;
+            let dot = dir_in.dot(dir_out).clamp(-1.0, 1.0);
+            let turn_angle = cross.atan2(dot); // positive = left turn
 
-            if half_angle.abs() < 1e-6 {
+            if turn_angle.abs() < 1e-6 {
                 turns.push(None);
                 continue;
             }
 
-            let full_angle = 2.0 * half_angle;
-            let tangent_length = cp.turn_radius * half_angle.tan();
-            let spiral_len = cp.spiral_length.min(tangent_length * 0.4); // don't let spiral exceed available space
+            let half_abs = turn_angle.abs() / 2.0;
+            let tan_half = half_abs.tan();
 
-            // Arc after removing spiral portions
-            let spiral_angle = if cp.turn_radius > 1e-6 {
-                spiral_len / (2.0 * cp.turn_radius) // approximate angle consumed by each spiral
+            // Clamp the effective turn radius so the tangent length fits within
+            // the available space on both adjacent segments (use at most 45% of
+            // each segment length to leave room for turns at neighboring points).
+            let max_tangent = (lengths[i - 1].min(lengths[i])) * 0.45;
+            let max_radius = if tan_half > 1e-6 {
+                max_tangent / tan_half
+            } else {
+                cp.turn_radius
+            };
+            let radius = cp.turn_radius.min(max_radius).max(0.0);
+
+            if radius < 1e-6 {
+                turns.push(None);
+                continue;
+            }
+
+            // Limit spiral length to fit within a reasonable fraction of the tangent distance
+            let basic_tangent = radius * tan_half;
+            let spiral_len = cp.spiral_length.min(basic_tangent * 0.4);
+
+            // The spiral consumes some of the turn angle
+            let spiral_angle = if radius > 1e-6 {
+                spiral_len / (2.0 * radius)
             } else {
                 0.0
             };
-            let arc_angle = (full_angle - 2.0 * spiral_angle).max(0.0);
-            let curvature = 1.0 / cp.turn_radius;
-            let arc_length = arc_angle * cp.turn_radius;
 
-            // Determine turn direction (left or right)
-            let cross = dir_in.x * dir_out.y - dir_in.y * dir_out.x;
-            let signed_curvature = if cross >= 0.0 { curvature } else { -curvature };
+            // Compute spiral shift (p) and long tangent offset (k) from the
+            // spiral endpoint, using the standard highway design formulas.
+            // Evaluate the spiral to get its endpoint in local coordinates.
+            let (tangent_length, arc_abs_angle) = if spiral_len > 1e-6 {
+                let spiral_end = Segment::Spiral {
+                    length: spiral_len,
+                    k_start: 0.0,
+                    k_end: 1.0 / radius, // unsigned curvature for computation
+                }
+                .evaluate(spiral_len);
+                let x_s = spiral_end.position.x;
+                let y_s = spiral_end.position.y;
+                // p = lateral shift of spiral from the arc
+                let p = y_s - radius * (1.0 - spiral_angle.cos());
+                // k = longitudinal offset
+                let k = x_s - radius * spiral_angle.sin();
+                let t = (radius + p) * tan_half + k;
+                let arc_angle = (turn_angle.abs() - 2.0 * spiral_angle).max(0.0);
+                (t, arc_angle)
+            } else {
+                (basic_tangent, turn_angle.abs())
+            };
+
+            let arc_length = arc_abs_angle * radius;
+            let signed_curvature = turn_angle.signum() / radius;
 
             turns.push(Some(TurnInfo {
-                tangent_length: tangent_length + spiral_len,
-                arc_angle,
+                tangent_length,
+                turn_angle,
                 arc_length,
                 spiral_length: spiral_len,
                 curvature: signed_curvature,
@@ -135,27 +176,26 @@ impl ReferenceLine {
         }
         turns.push(None); // last point has no turn
 
-        // Now build the segment chain
+        // Build the segment chain.
+        // After each turn, snap heading to the exact outgoing tangent direction
+        // to avoid accumulated numerical drift. Line lengths are computed
+        // dynamically from current_pos to absorb small position errors from spirals.
         let mut current_pos = points[0].position;
-        let mut current_heading = tangents[0].y.atan2(tangents[0].x);
+        let mut current_heading = tangent_headings[0];
 
         for i in 0..n - 1 {
-            let _seg_heading = tangents[i].y.atan2(tangents[i].x);
-
-            // How much of this line segment is available?
-            let total_line_length = lengths[i];
-            let consumed_start = if let Some(ref t) = turns[i] {
-                t.tangent_length
+            // Compute the target point for this line segment: the tangent point
+            // on the incoming side of the next turn, or the final control point.
+            let target = if let Some(ref turn) = turns[i + 1] {
+                // Tangent point = control point minus tangent_length along incoming dir
+                points[i + 1].position - tangents[i] * turn.tangent_length
             } else {
-                0.0
-            };
-            let consumed_end = if let Some(ref t) = turns[i + 1] {
-                t.tangent_length
-            } else {
-                0.0
+                points[i + 1].position
             };
 
-            let available = (total_line_length - consumed_start - consumed_end).max(0.0);
+            // Line length = projection of (target - current_pos) onto heading direction
+            let heading_dir = Vec2::new(current_heading.cos(), current_heading.sin());
+            let available = (target - current_pos).dot(heading_dir).max(0.0);
 
             // Emit line segment (if there's room)
             if available > 1e-4 {
@@ -165,7 +205,6 @@ impl ReferenceLine {
                 s_offsets.push(current_s);
                 current_s += available;
 
-                // Advance position
                 let dir = Vec2::new(current_heading.cos(), current_heading.sin());
                 current_pos += dir * available;
             }
@@ -246,6 +285,12 @@ impl ReferenceLine {
                     );
                     current_heading += pose.heading;
                     current_s += turn.spiral_length;
+                }
+
+                // Snap heading to exact outgoing tangent direction to prevent drift.
+                // Position flows naturally from the geometry to avoid discontinuities.
+                if i + 1 < n - 1 {
+                    current_heading = tangent_headings[i + 1];
                 }
             }
         }
@@ -377,9 +422,102 @@ mod tests {
         let start = rl.evaluate(0.0);
         assert!((start.position - points[0].position).length() < 0.01);
 
-        // End should be near last point (some error due to arc/spiral geometry)
+        // End should be near last point
         let end = rl.evaluate(rl.total_length);
-        assert!((end.position - points[2].position).length() < 5.0);
+        assert!((end.position - points[2].position).length() < 1.0);
+    }
+
+    #[test]
+    fn fit_four_points_s_curve() {
+        // S-curve: right then left
+        let points = vec![
+            ControlPoint {
+                position: Vec2::new(0.0, 0.0),
+                turn_radius: 0.0,
+                spiral_length: 0.0,
+            },
+            ControlPoint {
+                position: Vec2::new(50.0, 0.0),
+                turn_radius: 20.0,
+                spiral_length: 5.0,
+            },
+            ControlPoint {
+                position: Vec2::new(50.0, 50.0),
+                turn_radius: 20.0,
+                spiral_length: 5.0,
+            },
+            ControlPoint {
+                position: Vec2::new(100.0, 50.0),
+                turn_radius: 0.0,
+                spiral_length: 0.0,
+            },
+        ];
+        let rl = ReferenceLine::fit(&points).unwrap();
+        assert!(rl.total_length > 0.0);
+
+        let start = rl.evaluate(0.0);
+        assert!((start.position - points[0].position).length() < 0.01);
+
+        let end = rl.evaluate(rl.total_length);
+        assert!(
+            (end.position - points[3].position).length() < 1.0,
+            "end {:?} far from target {:?}, dist={}",
+            end.position,
+            points[3].position,
+            (end.position - points[3].position).length()
+        );
+    }
+
+    #[test]
+    fn tessellation_no_extreme_values() {
+        // Verify that tessellation at 1m intervals produces no discontinuities
+        let points = vec![
+            ControlPoint {
+                position: Vec2::new(-20.0, 5.0),
+                turn_radius: 20.0,
+                spiral_length: 5.0,
+            },
+            ControlPoint {
+                position: Vec2::new(10.0, 3.0),
+                turn_radius: 20.0,
+                spiral_length: 5.0,
+            },
+            ControlPoint {
+                position: Vec2::new(15.0, -25.0),
+                turn_radius: 20.0,
+                spiral_length: 5.0,
+            },
+        ];
+        let rl = ReferenceLine::fit(&points).unwrap();
+
+        let n_samples = (rl.total_length / 1.0).ceil() as usize + 1;
+        let mut prev_pos: Option<Vec2> = None;
+        for i in 0..n_samples {
+            let s = (i as f32).min(rl.total_length);
+            let pose = rl.evaluate(s);
+            assert!(
+                !pose.position.x.is_nan() && !pose.position.y.is_nan(),
+                "NaN at s={}",
+                s
+            );
+            assert!(
+                pose.position.length() < 500.0,
+                "extreme pos at s={}: {:?}",
+                s,
+                pose.position
+            );
+            // No large jumps between consecutive 1m samples
+            if let Some(prev) = prev_pos {
+                let jump = pose.position - prev;
+                assert!(
+                    jump.length() < 2.0,
+                    "discontinuity at s={}: jump={}",
+                    s,
+                    jump.length()
+                );
+            }
+            prev_pos = Some(pose.position);
+        }
     }
 
     #[test]

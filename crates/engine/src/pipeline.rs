@@ -101,3 +101,148 @@ pub fn allocate_descriptor_set(
         .next()
         .ok_or(anyhow::anyhow!("Failed to allocate descriptor set"))
 }
+
+// ---------------------------------------------------------------------------
+// Graphics pipeline (dynamic rendering)
+// ---------------------------------------------------------------------------
+
+/// Configuration for creating a simple graphics pipeline with dynamic rendering.
+pub struct GraphicsPipelineDesc<'a> {
+    pub vertex_spirv: &'a [u32],
+    pub fragment_spirv: &'a [u32],
+    pub vertex_entry: &'a str,
+    pub fragment_entry: &'a str,
+    pub vertex_binding_descriptions: &'a [vk::VertexInputBindingDescription],
+    pub vertex_attribute_descriptions: &'a [vk::VertexInputAttributeDescription],
+    pub topology: vk::PrimitiveTopology,
+    pub color_attachment_format: vk::Format,
+    pub push_constant_ranges: &'a [vk::PushConstantRange],
+    pub descriptor_set_layouts: &'a [vk::DescriptorSetLayout],
+    pub line_width: f32,
+}
+
+/// Create a graphics pipeline using dynamic rendering (no render pass).
+/// Returns `(pipeline, pipeline_layout)`.
+pub fn create_graphics_pipeline(
+    device: &Device,
+    desc: &GraphicsPipelineDesc,
+) -> anyhow::Result<(vk::Pipeline, vk::PipelineLayout)> {
+    // Build null-terminated entry point names
+    let mut vert_entry_buf = desc.vertex_entry.as_bytes().to_vec();
+    vert_entry_buf.push(0);
+    let mut frag_entry_buf = desc.fragment_entry.as_bytes().to_vec();
+    frag_entry_buf.push(0);
+
+    // Shader modules
+    let vert_bytecode = Bytecode::new(bytemuck::cast_slice(desc.vertex_spirv))?;
+    let vert_module_info = vk::ShaderModuleCreateInfo::builder()
+        .code(vert_bytecode.code())
+        .code_size(vert_bytecode.code_size());
+    let vert_module = unsafe { device.create_shader_module(&vert_module_info, None)? };
+
+    let frag_bytecode = Bytecode::new(bytemuck::cast_slice(desc.fragment_spirv))?;
+    let frag_module_info = vk::ShaderModuleCreateInfo::builder()
+        .code(frag_bytecode.code())
+        .code_size(frag_bytecode.code_size());
+    let frag_module = unsafe { device.create_shader_module(&frag_module_info, None)? };
+
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(&vert_entry_buf)
+            .build(),
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_module)
+            .name(&frag_entry_buf)
+            .build(),
+    ];
+
+    // Vertex input
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder()
+        .vertex_binding_descriptions(desc.vertex_binding_descriptions)
+        .vertex_attribute_descriptions(desc.vertex_attribute_descriptions);
+
+    // Input assembly
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        .topology(desc.topology)
+        .primitive_restart_enable(false);
+
+    // Viewport/scissor — dynamic state
+    let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        .viewport_count(1)
+        .scissor_count(1);
+
+    // Rasterization
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(desc.line_width);
+
+    // Multisample
+    let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+        .rasterization_samples(vk::SampleCountFlags::_1);
+
+    // Color blend (alpha blending)
+    let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::builder()
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+        .alpha_blend_op(vk::BlendOp::ADD)
+        .color_write_mask(vk::ColorComponentFlags::all())
+        .build()];
+
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
+        .attachments(&color_blend_attachments);
+
+    // Dynamic state
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_states);
+
+    // Dynamic rendering info (no render pass)
+    let color_formats = [desc.color_attachment_format];
+    let mut rendering_info = vk::PipelineRenderingCreateInfo::builder()
+        .color_attachment_formats(&color_formats);
+
+    // Pipeline layout
+    let layout_info = vk::PipelineLayoutCreateInfo::builder()
+        .set_layouts(desc.descriptor_set_layouts)
+        .push_constant_ranges(desc.push_constant_ranges);
+    let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
+
+    // Create pipeline
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout)
+        .push_next(&mut rendering_info);
+
+    let pipeline = unsafe {
+        device
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[*pipeline_info], None)?
+            .0
+            .into_iter()
+            .next()
+            .ok_or(anyhow::anyhow!("Failed to create graphics pipeline"))?
+    };
+
+    // Clean up shader modules
+    unsafe {
+        device.destroy_shader_module(vert_module, None);
+        device.destroy_shader_module(frag_module, None);
+    }
+
+    Ok((pipeline, pipeline_layout))
+}

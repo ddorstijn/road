@@ -14,7 +14,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    // Pixel to NDC
+    // Pixel to NDC. Negate Y because this is a compute shader — naga's
+    // ADJUST_COORDINATE_SPACE only flips Y in vertex shaders, not compute.
     let uv = vec2<f32>(
         (f32(id.x) + 0.5) / f32(size.x) * 2.0 - 1.0,
         -((f32(id.y) + 0.5) / f32(size.y) * 2.0 - 1.0),

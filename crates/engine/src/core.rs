@@ -429,7 +429,7 @@ impl Drop for Core {
 // Vulkan utility functions
 // ---------------------------------------------------------------------------
 
-pub(crate) fn transition_image(
+pub fn transition_image(
     device: &Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,

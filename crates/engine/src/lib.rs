@@ -27,6 +27,8 @@ pub use vulkanalia::{vk, vk::DeviceV1_0, vk::DeviceV1_3, vk::Handle, vk::HasBuil
 pub use vulkanalia_bootstrap::Device as VkDevice;
 pub use vulkanalia_vma as vma;
 
+pub use crate::core::transition_image;
+
 // ---------------------------------------------------------------------------
 // App trait — implemented by the game
 // ---------------------------------------------------------------------------
@@ -73,6 +75,10 @@ pub struct InputState {
     pub left_mouse: bool,
     pub right_mouse: bool,
     pub middle_mouse: bool,
+    /// True for one frame when left mouse was just pressed.
+    pub left_mouse_pressed: bool,
+    /// True for one frame when right mouse was just pressed.
+    pub right_mouse_pressed: bool,
 }
 
 impl InputState {
@@ -80,6 +86,8 @@ impl InputState {
         self.mouse_dx = 0.0;
         self.mouse_dy = 0.0;
         self.scroll_delta = 0.0;
+        self.left_mouse_pressed = false;
+        self.right_mouse_pressed = false;
     }
 }
 
@@ -185,8 +193,8 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                self.input.mouse_dx = position.x - self.input.mouse_x;
-                self.input.mouse_dy = position.y - self.input.mouse_y;
+                self.input.mouse_dx += position.x - self.input.mouse_x;
+                self.input.mouse_dy += position.y - self.input.mouse_y;
                 self.input.mouse_x = position.x;
                 self.input.mouse_y = position.y;
             }
@@ -194,8 +202,18 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 match button {
-                    MouseButton::Left => self.input.left_mouse = pressed,
-                    MouseButton::Right => self.input.right_mouse = pressed,
+                    MouseButton::Left => {
+                        if pressed && !self.input.left_mouse {
+                            self.input.left_mouse_pressed = true;
+                        }
+                        self.input.left_mouse = pressed;
+                    }
+                    MouseButton::Right => {
+                        if pressed && !self.input.right_mouse {
+                            self.input.right_mouse_pressed = true;
+                        }
+                        self.input.right_mouse = pressed;
+                    }
                     MouseButton::Middle => self.input.middle_mouse = pressed,
                     _ => {}
                 }

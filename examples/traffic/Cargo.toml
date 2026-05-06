@@ -7,4 +7,6 @@ edition = "2024"
 anyhow = "1.0.100"
 bytemuck = { version = "1.25", features = ["derive"] }
 engine = { path = "../../crates/engine" }
+glam = "0.32"
 log = "0.4"
+road = { path = "../../crates/road" }
