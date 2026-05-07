@@ -26,6 +26,8 @@ struct GpuLaneSection {
     s_end: f32,
     lane_offset: u32,
     lane_count: u32,
+    left_lane_count: u32,
+    _pad: u32,
 }
 
 struct GpuLane {

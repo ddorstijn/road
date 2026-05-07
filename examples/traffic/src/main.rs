@@ -18,7 +18,7 @@ const ROAD_LINE_SHADER: &str = include_str!("../../../assets/shaders/road_line.w
 const SDF_TYPES_WGSL: &str = include_str!("../../../assets/shaders/shared/types.wgsl");
 const SDF_ROAD_EVAL_WGSL: &str = include_str!("../../../assets/shaders/shared/road_eval.wgsl");
 const SDF_GENERATE_WGSL: &str = include_str!("../../../assets/shaders/sdf_generate.wgsl");
-const SDF_DEBUG_WGSL: &str = include_str!("../../../assets/shaders/sdf_debug.wgsl");
+const ROAD_RENDER_WGSL: &str = include_str!("../../../assets/shaders/road_render.wgsl");
 
 // ---------------------------------------------------------------------------
 // GPU data structs (SSBOs for later phases)
@@ -54,6 +54,8 @@ struct GpuLaneSection {
     s_end: f32,
     lane_offset: u32,
     lane_count: u32,
+    left_lane_count: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -190,6 +192,7 @@ impl GpuRoadData {
             let ls_offset = lane_sections.len() as u32;
             for section in &road_data.lane_sections {
                 let lane_offset = lanes.len() as u32;
+                let left_count = section.left_lanes.len() as u32;
                 let all_lanes: Vec<_> = section
                     .left_lanes
                     .iter()
@@ -210,6 +213,8 @@ impl GpuRoadData {
                     s_end: section.s_end,
                     lane_offset,
                     lane_count: all_lanes.len() as u32,
+                    left_lane_count: left_count,
+                    _pad: 0,
                 });
             }
 
@@ -292,13 +297,14 @@ struct TrafficApp {
     // SDF tile system
     sdf_manager: Option<SdfTileManager>,
 
-    // SDF debug visualization
-    sdf_debug_pipeline: vk::Pipeline,
-    sdf_debug_pipeline_layout: vk::PipelineLayout,
-    sdf_debug_descriptor_set_layout: vk::DescriptorSetLayout,
-    sdf_debug_descriptor_pool: vk::DescriptorPool,
-    sdf_debug_descriptor_set: vk::DescriptorSet,
-    sdf_debug_sampler: vk::Sampler,
+    // Road rendering (replaces SDF debug visualization)
+    road_render_pipeline: vk::Pipeline,
+    road_render_pipeline_layout: vk::PipelineLayout,
+    road_render_descriptor_set_layout: vk::DescriptorSetLayout,
+    road_render_descriptor_pool: vk::DescriptorPool,
+    road_render_descriptor_set: vk::DescriptorSet,
+    road_render_sampler: vk::Sampler,
+    road_render_descriptors_valid: bool,
 }
 
 impl Default for TrafficApp {
@@ -328,12 +334,13 @@ impl Default for TrafficApp {
 
             sdf_manager: None,
 
-            sdf_debug_pipeline: vk::Pipeline::null(),
-            sdf_debug_pipeline_layout: vk::PipelineLayout::null(),
-            sdf_debug_descriptor_set_layout: vk::DescriptorSetLayout::null(),
-            sdf_debug_descriptor_pool: vk::DescriptorPool::null(),
-            sdf_debug_descriptor_set: vk::DescriptorSet::null(),
-            sdf_debug_sampler: vk::Sampler::null(),
+            road_render_pipeline: vk::Pipeline::null(),
+            road_render_pipeline_layout: vk::PipelineLayout::null(),
+            road_render_descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            road_render_descriptor_pool: vk::DescriptorPool::null(),
+            road_render_descriptor_set: vk::DescriptorSet::null(),
+            road_render_sampler: vk::Sampler::null(),
+            road_render_descriptors_valid: false,
         }
     }
 }
@@ -473,8 +480,9 @@ impl TrafficApp {
             SDF_GENERATE_WGSL,
         )?;
 
-        // Create SDF debug visualization pipeline
-        let spirv = compile_wgsl(SDF_DEBUG_WGSL)?;
+        // Compile road render shader (prepend shared types for GpuRoad/GpuLaneSection/GpuLane)
+        let full_source = format!("{}\n{}", SDF_TYPES_WGSL, ROAD_RENDER_WGSL);
+        let spirv = compile_wgsl(&full_source)?;
 
         // Sampler for SDF atlas
         let sampler_info = vk::SamplerCreateInfo::builder()
@@ -482,9 +490,14 @@ impl TrafficApp {
             .min_filter(vk::Filter::NEAREST)
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        self.sdf_debug_sampler = unsafe { device.create_sampler(&sampler_info, None)? };
+        self.road_render_sampler = unsafe { device.create_sampler(&sampler_info, None)? };
 
-        // Descriptor: binding 0 = sampled image, binding 1 = sampler
+        // Descriptor layout: 5 bindings
+        //   0: sampled image (SDF atlas)
+        //   1: sampler
+        //   2: storage buffer (roads)
+        //   3: storage buffer (lane_sections)
+        //   4: storage buffer (lanes)
         let bindings = [
             vk::DescriptorSetLayoutBinding::builder()
                 .binding(0)
@@ -498,8 +511,26 @@ impl TrafficApp {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT)
                 .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
         ];
-        self.sdf_debug_descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
+        self.road_render_descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
 
         let pool_sizes = [
             vk::DescriptorPoolSize::builder()
@@ -510,37 +541,41 @@ impl TrafficApp {
                 .type_(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1)
                 .build(),
+            vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(3)
+                .build(),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::builder()
             .max_sets(1)
             .pool_sizes(&pool_sizes);
-        self.sdf_debug_descriptor_pool =
+        self.road_render_descriptor_pool =
             unsafe { device.create_descriptor_pool(&pool_info, None)? };
 
-        self.sdf_debug_descriptor_set = allocate_descriptor_set(
+        self.road_render_descriptor_set = allocate_descriptor_set(
             device,
-            self.sdf_debug_descriptor_pool,
-            self.sdf_debug_descriptor_set_layout,
+            self.road_render_descriptor_pool,
+            self.road_render_descriptor_set_layout,
         )?;
 
-        // Write descriptor for atlas image + sampler
+        // Write atlas image + sampler descriptors (these don't change)
         let image_info = [vk::DescriptorImageInfo::builder()
             .image_view(sdf_manager.atlas.view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .build()];
         let sampler_info_desc = [vk::DescriptorImageInfo::builder()
-            .sampler(self.sdf_debug_sampler)
+            .sampler(self.road_render_sampler)
             .build()];
         let writes = [
             vk::WriteDescriptorSet::builder()
-                .dst_set(self.sdf_debug_descriptor_set)
+                .dst_set(self.road_render_descriptor_set)
                 .dst_binding(0)
                 .dst_array_element(0)
                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                 .image_info(&image_info)
                 .build(),
             vk::WriteDescriptorSet::builder()
-                .dst_set(self.sdf_debug_descriptor_set)
+                .dst_set(self.road_render_descriptor_set)
                 .dst_binding(1)
                 .dst_array_element(0)
                 .descriptor_type(vk::DescriptorType::SAMPLER)
@@ -551,7 +586,7 @@ impl TrafficApp {
             device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
         }
 
-        // Graphics pipeline for debug quads
+        // Graphics pipeline for road rendering
         let push_constant_ranges = [vk::PushConstantRange::builder()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
@@ -568,16 +603,87 @@ impl TrafficApp {
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             color_attachment_format: ctx.draw_image.format,
             push_constant_ranges: &push_constant_ranges,
-            descriptor_set_layouts: &[self.sdf_debug_descriptor_set_layout],
+            descriptor_set_layouts: &[self.road_render_descriptor_set_layout],
             line_width: 1.0,
         };
 
         let (pipeline, layout) = create_graphics_pipeline(device, &desc)?;
-        self.sdf_debug_pipeline = pipeline;
-        self.sdf_debug_pipeline_layout = layout;
+        self.road_render_pipeline = pipeline;
+        self.road_render_pipeline_layout = layout;
 
         self.sdf_manager = Some(sdf_manager);
         Ok(())
+    }
+
+    /// Update road render descriptors when road data buffers change.
+    fn update_road_render_descriptors(&mut self, ctx: &EngineContext) {
+        let device = ctx.device.as_ref();
+        let road_buf = match &self.gpu_road_data.road_buffer {
+            Some(b) => b,
+            None => {
+                self.road_render_descriptors_valid = false;
+                return;
+            }
+        };
+        let ls_buf = match &self.gpu_road_data.lane_section_buffer {
+            Some(b) => b,
+            None => {
+                self.road_render_descriptors_valid = false;
+                return;
+            }
+        };
+        let lane_buf = match &self.gpu_road_data.lane_buffer {
+            Some(b) => b,
+            None => {
+                self.road_render_descriptors_valid = false;
+                return;
+            }
+        };
+
+        let road_buf_info = [vk::DescriptorBufferInfo::builder()
+            .buffer(road_buf.buffer)
+            .offset(0)
+            .range(road_buf.size)
+            .build()];
+        let ls_buf_info = [vk::DescriptorBufferInfo::builder()
+            .buffer(ls_buf.buffer)
+            .offset(0)
+            .range(ls_buf.size)
+            .build()];
+        let lane_buf_info = [vk::DescriptorBufferInfo::builder()
+            .buffer(lane_buf.buffer)
+            .offset(0)
+            .range(lane_buf.size)
+            .build()];
+
+        let writes = [
+            vk::WriteDescriptorSet::builder()
+                .dst_set(self.road_render_descriptor_set)
+                .dst_binding(2)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&road_buf_info)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(self.road_render_descriptor_set)
+                .dst_binding(3)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&ls_buf_info)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(self.road_render_descriptor_set)
+                .dst_binding(4)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&lane_buf_info)
+                .build(),
+        ];
+
+        unsafe {
+            device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
+        }
+        self.road_render_descriptors_valid = true;
     }
 
     /// Rebuild tile map data from current road network and upload to GPU.
@@ -855,6 +961,7 @@ impl App for TrafficApp {
         if self.dirty {
             self.gpu_road_data.upload(ctx.allocator, &self.network)?;
             self.rebuild_sdf_tiles(ctx)?;
+            self.update_road_render_descriptors(ctx);
             self.dirty = false;
         }
 
@@ -976,20 +1083,20 @@ impl App for TrafficApp {
                 let aspect = ctx.window_width as f32 / ctx.window_height as f32;
                 let vp = ctx.camera.view_projection(aspect);
 
-                // --- Draw SDF debug tiles ---
+                // --- Draw road tiles ---
                 if let Some(sdf) = &self.sdf_manager {
-                    if !sdf.tile_map.tiles.is_empty() {
+                    if !sdf.tile_map.tiles.is_empty() && self.road_render_descriptors_valid {
                         device.cmd_bind_pipeline(
                             cmd,
                             vk::PipelineBindPoint::GRAPHICS,
-                            self.sdf_debug_pipeline,
+                            self.road_render_pipeline,
                         );
                         device.cmd_bind_descriptor_sets(
                             cmd,
                             vk::PipelineBindPoint::GRAPHICS,
-                            self.sdf_debug_pipeline_layout,
+                            self.road_render_pipeline_layout,
                             0,
-                            &[self.sdf_debug_descriptor_set],
+                            &[self.road_render_descriptor_set],
                             &[],
                         );
 
@@ -1015,7 +1122,7 @@ impl App for TrafficApp {
 
                             device.cmd_push_constants(
                                 cmd,
-                                self.sdf_debug_pipeline_layout,
+                                self.road_render_pipeline_layout,
                                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                                 0,
                                 bytemuck::bytes_of(&pc),
@@ -1096,14 +1203,14 @@ impl App for TrafficApp {
             ctx.device.destroy_pipeline(self.line_pipeline, None);
             ctx.device
                 .destroy_pipeline_layout(self.line_pipeline_layout, None);
-            ctx.device.destroy_pipeline(self.sdf_debug_pipeline, None);
+            ctx.device.destroy_pipeline(self.road_render_pipeline, None);
             ctx.device
-                .destroy_pipeline_layout(self.sdf_debug_pipeline_layout, None);
+                .destroy_pipeline_layout(self.road_render_pipeline_layout, None);
             ctx.device
-                .destroy_descriptor_pool(self.sdf_debug_descriptor_pool, None);
+                .destroy_descriptor_pool(self.road_render_descriptor_pool, None);
             ctx.device
-                .destroy_descriptor_set_layout(self.sdf_debug_descriptor_set_layout, None);
-            ctx.device.destroy_sampler(self.sdf_debug_sampler, None);
+                .destroy_descriptor_set_layout(self.road_render_descriptor_set_layout, None);
+            ctx.device.destroy_sampler(self.road_render_sampler, None);
         }
         if let Some(b) = self.polyline_buffer.take() {
             b.destroy(ctx.allocator);

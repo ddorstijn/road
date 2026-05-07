@@ -135,13 +135,16 @@ fn closest_point_arc(point: vec2<f32>, seg_length: f32, curvature: f32) -> Close
     let center = vec2<f32>(0.0, r);
     let to_point = point - center;
 
-    var angle = atan2(-to_point.x, to_point.y * sign(curvature));
-    if angle < 0.0 {
-        angle += 6.283185307;  // 2 * PI
-    }
+    // Recover the arc angle θ = atan2(sin θ, cos θ).
+    // k·to_point.x = sin(θ), -k·to_point.y = cos(θ).
+    let theta = atan2(curvature * to_point.x, -curvature * to_point.y);
+    // Convert to unsigned sweep: for k>0 θ≥0 on arc, for k<0 θ≤0 on arc.
+    // Multiplying by sign(k) gives the unsigned angular extent.
+    // Points behind the start get negative values → clamped to 0.
+    let unsigned_angle = theta * sign(curvature);
 
     let max_angle = abs(seg_length * curvature);
-    let clamped_angle = clamp(angle, 0.0, max_angle);
+    let clamped_angle = clamp(unsigned_angle, 0.0, max_angle);
     result.s = clamped_angle / abs(curvature);
 
     // Evaluate arc at clamped s for the actual closest point
