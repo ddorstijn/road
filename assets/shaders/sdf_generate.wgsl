@@ -82,10 +82,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Write to atlas: (signed_distance, s_coordinate, road_index, 0)
+    // Write to atlas: (signed_distance, s_coordinate, road_index, s_mod_period)
+    // Alpha stores s % 6.0 (dash period) to preserve precision in fp16 atlases
+    let s_mod = best_s % 6.0;
     let atlas_pos = vec2<i32>(
         i32(pc.atlas_offset_x + id.x),
         i32(pc.atlas_offset_y + id.y),
     );
-    textureStore(sdf_atlas, atlas_pos, vec4<f32>(best_signed_dist, best_s, best_road, 0.0));
+    textureStore(sdf_atlas, atlas_pos, vec4<f32>(best_signed_dist, best_s, best_road, s_mod));
 }

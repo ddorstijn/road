@@ -81,6 +81,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let signed_dist = sdf_val.x;
     let s_coord = sdf_val.y;
     let road_id_f = sdf_val.z;
+    let s_mod_period = sdf_val.w;  // s % 6.0, high-precision for dash patterns
 
     // No road nearby — fully transparent
     if road_id_f < 0.0 {
@@ -154,9 +155,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             var vis = marking_visibility(boundary_dist);
 
             if is_dashed(lane.marking_type) {
-                let period = DASH_LENGTH + GAP_LENGTH;
-                let t = s_coord % period;
-                if t > DASH_LENGTH {
+                // Use pre-computed s % 6.0 from atlas alpha for fp16 precision
+                if s_mod_period > DASH_LENGTH {
                     vis = 0.0;
                 }
             }

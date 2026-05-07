@@ -4,7 +4,7 @@ use engine::pipeline::{
     create_descriptor_set_layout, create_graphics_pipeline,
 };
 use engine::sdf::{
-    RoadSegmentInfo, SdfTileManager, TILE_RESOLUTION, TILE_SIZE, compute_segment_aabbs,
+    ATLAS_TILES, RoadSegmentInfo, SdfTileManager, TILE_RESOLUTION, TILE_SIZE, compute_segment_aabbs,
 };
 use engine::vk::{DeviceV1_0, DeviceV1_3, Handle, HasBuilder};
 use engine::{App, EngineContext, transition_image, vk};
@@ -22,6 +22,15 @@ const SDF_GENERATE_WGSL: &str = include_str!("../../../assets/shaders/sdf_genera
 const ROAD_RENDER_WGSL: &str = include_str!("../../../assets/shaders/road_render.wgsl");
 const TRAFFIC_UPDATE_WGSL: &str = include_str!("../../../assets/shaders/traffic_update.wgsl");
 const CAR_DEBUG_WGSL: &str = include_str!("../../../assets/shaders/car_debug.wgsl");
+const TRAFFIC_SORT_KEYS_WGSL: &str = include_str!("../../../assets/shaders/traffic_sort_keys.wgsl");
+const TRAFFIC_SORT_HISTOGRAM_WGSL: &str =
+    include_str!("../../../assets/shaders/traffic_sort_histogram.wgsl");
+const TRAFFIC_SORT_SCAN_WGSL: &str = include_str!("../../../assets/shaders/traffic_sort_scan.wgsl");
+const TRAFFIC_SORT_SCATTER_WGSL: &str =
+    include_str!("../../../assets/shaders/traffic_sort_scatter.wgsl");
+const TRAFFIC_IDM_WGSL: &str = include_str!("../../../assets/shaders/traffic_idm.wgsl");
+const TRAFFIC_LANE_CHANGE_WGSL: &str =
+    include_str!("../../../assets/shaders/traffic_lane_change.wgsl");
 
 // ---------------------------------------------------------------------------
 // GPU data structs (SSBOs for later phases)
@@ -112,6 +121,15 @@ const MAX_CARS: u32 = 524_288;
 /// Fixed simulation timestep (1/60 s)
 const SIM_DT: f32 = 1.0 / 60.0;
 
+/// Sort workgroup tile size (elements per workgroup)
+const SORT_TILE_SIZE: u32 = 256;
+
+/// Number of radix sort workgroups
+const NUM_SORT_WG: u32 = MAX_CARS / SORT_TILE_SIZE; // 2048
+
+/// MOBIL lane change frequency (every N simulation ticks)
+const LANE_CHANGE_INTERVAL: u32 = 30;
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct TrafficUpdatePushConstants {
@@ -129,6 +147,72 @@ struct CarDebugPushConstants {
     _pad2: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SortKeysPushConstants {
+    car_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SortHistogramPushConstants {
+    pass_id: u32,
+    car_count: u32,
+    num_workgroups: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SortScanPushConstants {
+    num_workgroups: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SortScatterPushConstants {
+    pass_id: u32,
+    car_count: u32,
+    num_workgroups: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct IdmPushConstants {
+    dt: f32,
+    car_count: u32,
+    a_max: f32,
+    b_comfort: f32,
+    s0: f32,
+    time_headway: f32,
+    car_length: f32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MobilPushConstants {
+    car_count: u32,
+    a_max: f32,
+    b_comfort: f32,
+    s0: f32,
+    time_headway: f32,
+    car_length: f32,
+    politeness: f32,
+    threshold: f32,
+    b_safe: f32,
+    max_right_lanes: i32,
+    max_left_lanes: i32,
+    _pad: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Traffic simulation state
 // ---------------------------------------------------------------------------
@@ -143,12 +227,58 @@ struct TrafficSim {
     // Road lengths buffer (one f32 per road, for the compute shader)
     road_lengths_buf: Option<GpuBuffer>,
 
-    // Compute pipeline (traffic_update)
+    // Sort buffers (ping-pong)
+    sort_keys_a_buf: Option<GpuBuffer>,
+    sort_keys_b_buf: Option<GpuBuffer>,
+    sort_vals_a_buf: Option<GpuBuffer>,
+    sort_vals_b_buf: Option<GpuBuffer>,
+    sort_histogram_buf: Option<GpuBuffer>,
+
+    // Compute pipeline (traffic_update — used as fallback before sort is ready)
     update_pipeline: vk::Pipeline,
     update_pipeline_layout: vk::PipelineLayout,
     update_descriptor_set_layout: vk::DescriptorSetLayout,
     update_descriptor_pool: vk::DescriptorPool,
     update_descriptor_set: vk::DescriptorSet,
+
+    // Sort pipelines
+    sort_keys_pipeline: vk::Pipeline,
+    sort_keys_pipeline_layout: vk::PipelineLayout,
+    sort_keys_descriptor_set_layout: vk::DescriptorSetLayout,
+    sort_keys_descriptor_pool: vk::DescriptorPool,
+    sort_keys_descriptor_set: vk::DescriptorSet,
+
+    sort_histogram_pipeline: vk::Pipeline,
+    sort_histogram_pipeline_layout: vk::PipelineLayout,
+    sort_histogram_descriptor_set_layout: vk::DescriptorSetLayout,
+    sort_histogram_descriptor_pool: vk::DescriptorPool,
+    sort_histogram_descriptor_sets: [vk::DescriptorSet; 2], // [read A, read B]
+
+    sort_scan_pipeline: vk::Pipeline,
+    sort_scan_pipeline_layout: vk::PipelineLayout,
+    sort_scan_descriptor_set_layout: vk::DescriptorSetLayout,
+    sort_scan_descriptor_pool: vk::DescriptorPool,
+    sort_scan_descriptor_set: vk::DescriptorSet,
+
+    sort_scatter_pipeline: vk::Pipeline,
+    sort_scatter_pipeline_layout: vk::PipelineLayout,
+    sort_scatter_descriptor_set_layout: vk::DescriptorSetLayout,
+    sort_scatter_descriptor_pool: vk::DescriptorPool,
+    sort_scatter_descriptor_sets: [vk::DescriptorSet; 2], // [A→B, B→A]
+
+    // IDM pipeline
+    idm_pipeline: vk::Pipeline,
+    idm_pipeline_layout: vk::PipelineLayout,
+    idm_descriptor_set_layout: vk::DescriptorSetLayout,
+    idm_descriptor_pool: vk::DescriptorPool,
+    idm_descriptor_set: vk::DescriptorSet,
+
+    // MOBIL pipeline
+    mobil_pipeline: vk::Pipeline,
+    mobil_pipeline_layout: vk::PipelineLayout,
+    mobil_descriptor_set_layout: vk::DescriptorSetLayout,
+    mobil_descriptor_pool: vk::DescriptorPool,
+    mobil_descriptor_set: vk::DescriptorSet,
 
     // Graphics pipeline (car debug vis)
     debug_pipeline: vk::Pipeline,
@@ -161,6 +291,7 @@ struct TrafficSim {
     // Simulation state
     car_count: u32,
     sim_accumulator: f32,
+    sim_tick: u32,
     initialized: bool,
 }
 
@@ -174,11 +305,53 @@ impl Default for TrafficSim {
             car_desired_speed_buf: None,
             road_lengths_buf: None,
 
+            sort_keys_a_buf: None,
+            sort_keys_b_buf: None,
+            sort_vals_a_buf: None,
+            sort_vals_b_buf: None,
+            sort_histogram_buf: None,
+
             update_pipeline: vk::Pipeline::null(),
             update_pipeline_layout: vk::PipelineLayout::null(),
             update_descriptor_set_layout: vk::DescriptorSetLayout::null(),
             update_descriptor_pool: vk::DescriptorPool::null(),
             update_descriptor_set: vk::DescriptorSet::null(),
+
+            sort_keys_pipeline: vk::Pipeline::null(),
+            sort_keys_pipeline_layout: vk::PipelineLayout::null(),
+            sort_keys_descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            sort_keys_descriptor_pool: vk::DescriptorPool::null(),
+            sort_keys_descriptor_set: vk::DescriptorSet::null(),
+
+            sort_histogram_pipeline: vk::Pipeline::null(),
+            sort_histogram_pipeline_layout: vk::PipelineLayout::null(),
+            sort_histogram_descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            sort_histogram_descriptor_pool: vk::DescriptorPool::null(),
+            sort_histogram_descriptor_sets: [vk::DescriptorSet::null(); 2],
+
+            sort_scan_pipeline: vk::Pipeline::null(),
+            sort_scan_pipeline_layout: vk::PipelineLayout::null(),
+            sort_scan_descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            sort_scan_descriptor_pool: vk::DescriptorPool::null(),
+            sort_scan_descriptor_set: vk::DescriptorSet::null(),
+
+            sort_scatter_pipeline: vk::Pipeline::null(),
+            sort_scatter_pipeline_layout: vk::PipelineLayout::null(),
+            sort_scatter_descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            sort_scatter_descriptor_pool: vk::DescriptorPool::null(),
+            sort_scatter_descriptor_sets: [vk::DescriptorSet::null(); 2],
+
+            idm_pipeline: vk::Pipeline::null(),
+            idm_pipeline_layout: vk::PipelineLayout::null(),
+            idm_descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            idm_descriptor_pool: vk::DescriptorPool::null(),
+            idm_descriptor_set: vk::DescriptorSet::null(),
+
+            mobil_pipeline: vk::Pipeline::null(),
+            mobil_pipeline_layout: vk::PipelineLayout::null(),
+            mobil_descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            mobil_descriptor_pool: vk::DescriptorPool::null(),
+            mobil_descriptor_set: vk::DescriptorSet::null(),
 
             debug_pipeline: vk::Pipeline::null(),
             debug_pipeline_layout: vk::PipelineLayout::null(),
@@ -189,6 +362,7 @@ impl Default for TrafficSim {
 
             car_count: 0,
             sim_accumulator: 0.0,
+            sim_tick: 0,
             initialized: false,
         }
     }
@@ -310,6 +484,306 @@ impl TrafficSim {
             self.debug_pipeline_layout = layout;
         }
 
+        // --- Sort: build keys pipeline ---
+        {
+            // Bindings: 0-3 car_road_id/car_s/car_lane/road_lengths (read),
+            //           4-5 sort_keys/sort_vals (write)
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..6)
+                .map(|i| {
+                    vk::DescriptorSetLayoutBinding::builder()
+                        .binding(i)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                        .build()
+                })
+                .collect();
+
+            self.sort_keys_descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
+
+            let pool_sizes = [vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(6)
+                .build()];
+            let pool_info = vk::DescriptorPoolCreateInfo::builder()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes);
+            self.sort_keys_descriptor_pool =
+                unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+            self.sort_keys_descriptor_set = allocate_descriptor_set(
+                device,
+                self.sort_keys_descriptor_pool,
+                self.sort_keys_descriptor_set_layout,
+            )?;
+
+            let spirv = compile_wgsl(TRAFFIC_SORT_KEYS_WGSL)?;
+            let push_constant_ranges = [vk::PushConstantRange::builder()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(std::mem::size_of::<SortKeysPushConstants>() as u32)
+                .build()];
+
+            let (pipeline, layout) = create_compute_pipeline(
+                device,
+                &spirv,
+                &[self.sort_keys_descriptor_set_layout],
+                &push_constant_ranges,
+            )?;
+            self.sort_keys_pipeline = pipeline;
+            self.sort_keys_pipeline_layout = layout;
+        }
+
+        // --- Sort: histogram pipeline ---
+        {
+            // Bindings: 0 keys_in (read), 1 histograms (read_write)
+            let bindings = [
+                vk::DescriptorSetLayoutBinding::builder()
+                    .binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    .build(),
+                vk::DescriptorSetLayoutBinding::builder()
+                    .binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    .build(),
+            ];
+
+            self.sort_histogram_descriptor_set_layout =
+                create_descriptor_set_layout(device, &bindings)?;
+
+            let pool_sizes = [vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(4) // 2 bindings × 2 sets
+                .build()];
+            let pool_info = vk::DescriptorPoolCreateInfo::builder()
+                .max_sets(2)
+                .pool_sizes(&pool_sizes);
+            self.sort_histogram_descriptor_pool =
+                unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+            for i in 0..2 {
+                self.sort_histogram_descriptor_sets[i] = allocate_descriptor_set(
+                    device,
+                    self.sort_histogram_descriptor_pool,
+                    self.sort_histogram_descriptor_set_layout,
+                )?;
+            }
+
+            let spirv = compile_wgsl(TRAFFIC_SORT_HISTOGRAM_WGSL)?;
+            let push_constant_ranges = [vk::PushConstantRange::builder()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(std::mem::size_of::<SortHistogramPushConstants>() as u32)
+                .build()];
+
+            let (pipeline, layout) = create_compute_pipeline(
+                device,
+                &spirv,
+                &[self.sort_histogram_descriptor_set_layout],
+                &push_constant_ranges,
+            )?;
+            self.sort_histogram_pipeline = pipeline;
+            self.sort_histogram_pipeline_layout = layout;
+        }
+
+        // --- Sort: prefix sum (scan) pipeline ---
+        {
+            // Binding: 0 histograms (read_write)
+            let bindings = [vk::DescriptorSetLayoutBinding::builder()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .build()];
+
+            self.sort_scan_descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
+
+            let pool_sizes = [vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .build()];
+            let pool_info = vk::DescriptorPoolCreateInfo::builder()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes);
+            self.sort_scan_descriptor_pool =
+                unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+            self.sort_scan_descriptor_set = allocate_descriptor_set(
+                device,
+                self.sort_scan_descriptor_pool,
+                self.sort_scan_descriptor_set_layout,
+            )?;
+
+            let spirv = compile_wgsl(TRAFFIC_SORT_SCAN_WGSL)?;
+            let push_constant_ranges = [vk::PushConstantRange::builder()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(std::mem::size_of::<SortScanPushConstants>() as u32)
+                .build()];
+
+            let (pipeline, layout) = create_compute_pipeline(
+                device,
+                &spirv,
+                &[self.sort_scan_descriptor_set_layout],
+                &push_constant_ranges,
+            )?;
+            self.sort_scan_pipeline = pipeline;
+            self.sort_scan_pipeline_layout = layout;
+        }
+
+        // --- Sort: scatter pipeline ---
+        {
+            // Bindings: 0 keys_in, 1 vals_in, 2 keys_out, 3 vals_out, 4 histograms
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..5)
+                .map(|i| {
+                    vk::DescriptorSetLayoutBinding::builder()
+                        .binding(i)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                        .build()
+                })
+                .collect();
+
+            self.sort_scatter_descriptor_set_layout =
+                create_descriptor_set_layout(device, &bindings)?;
+
+            let pool_sizes = [vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(10) // 5 bindings × 2 sets
+                .build()];
+            let pool_info = vk::DescriptorPoolCreateInfo::builder()
+                .max_sets(2)
+                .pool_sizes(&pool_sizes);
+            self.sort_scatter_descriptor_pool =
+                unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+            for i in 0..2 {
+                self.sort_scatter_descriptor_sets[i] = allocate_descriptor_set(
+                    device,
+                    self.sort_scatter_descriptor_pool,
+                    self.sort_scatter_descriptor_set_layout,
+                )?;
+            }
+
+            let spirv = compile_wgsl(TRAFFIC_SORT_SCATTER_WGSL)?;
+            let push_constant_ranges = [vk::PushConstantRange::builder()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(std::mem::size_of::<SortScatterPushConstants>() as u32)
+                .build()];
+
+            let (pipeline, layout) = create_compute_pipeline(
+                device,
+                &spirv,
+                &[self.sort_scatter_descriptor_set_layout],
+                &push_constant_ranges,
+            )?;
+            self.sort_scatter_pipeline = pipeline;
+            self.sort_scatter_pipeline_layout = layout;
+        }
+
+        // --- IDM car-following pipeline ---
+        {
+            // Bindings: 0-4 car SoA, 5 road_lengths, 6 sorted_indices
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..7)
+                .map(|i| {
+                    vk::DescriptorSetLayoutBinding::builder()
+                        .binding(i)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                        .build()
+                })
+                .collect();
+
+            self.idm_descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
+
+            let pool_sizes = [vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(7)
+                .build()];
+            let pool_info = vk::DescriptorPoolCreateInfo::builder()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes);
+            self.idm_descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+            self.idm_descriptor_set = allocate_descriptor_set(
+                device,
+                self.idm_descriptor_pool,
+                self.idm_descriptor_set_layout,
+            )?;
+
+            let spirv = compile_wgsl(TRAFFIC_IDM_WGSL)?;
+            let push_constant_ranges = [vk::PushConstantRange::builder()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(std::mem::size_of::<IdmPushConstants>() as u32)
+                .build()];
+
+            let (pipeline, layout) = create_compute_pipeline(
+                device,
+                &spirv,
+                &[self.idm_descriptor_set_layout],
+                &push_constant_ranges,
+            )?;
+            self.idm_pipeline = pipeline;
+            self.idm_pipeline_layout = layout;
+        }
+
+        // --- MOBIL lane change pipeline ---
+        {
+            // Bindings: 0-4 car SoA, 5 road_lengths, 6 sorted_indices
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..7)
+                .map(|i| {
+                    vk::DescriptorSetLayoutBinding::builder()
+                        .binding(i)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                        .build()
+                })
+                .collect();
+
+            self.mobil_descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
+
+            let pool_sizes = [vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(7)
+                .build()];
+            let pool_info = vk::DescriptorPoolCreateInfo::builder()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes);
+            self.mobil_descriptor_pool =
+                unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+            self.mobil_descriptor_set = allocate_descriptor_set(
+                device,
+                self.mobil_descriptor_pool,
+                self.mobil_descriptor_set_layout,
+            )?;
+
+            let spirv = compile_wgsl(TRAFFIC_LANE_CHANGE_WGSL)?;
+            let push_constant_ranges = [vk::PushConstantRange::builder()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(std::mem::size_of::<MobilPushConstants>() as u32)
+                .build()];
+
+            let (pipeline, layout) = create_compute_pipeline(
+                device,
+                &spirv,
+                &[self.mobil_descriptor_set_layout],
+                &push_constant_ranges,
+            )?;
+            self.mobil_pipeline = pipeline;
+            self.mobil_pipeline_layout = layout;
+        }
+
         Ok(())
     }
 
@@ -404,6 +878,25 @@ impl TrafficSim {
         self.car_desired_speed_buf = Some(desired_buf);
         self.road_lengths_buf = Some(lengths_buf);
 
+        // Allocate sort buffers (always MAX_CARS to avoid reallocation)
+        let sort_buf_size = (MAX_CARS as u64) * 4;
+        let (keys_a, _) = GpuBuffer::new_mapped(allocator, sort_buf_size, usage)?;
+        let (keys_b, _) = GpuBuffer::new_mapped(allocator, sort_buf_size, usage)?;
+        let (vals_a, _) = GpuBuffer::new_mapped(allocator, sort_buf_size, usage)?;
+        let (vals_b, _) = GpuBuffer::new_mapped(allocator, sort_buf_size, usage)?;
+
+        // Histogram buffer: 256 digits × NUM_SORT_WG workgroups × 4 bytes
+        let hist_size = (256u64) * (NUM_SORT_WG as u64) * 4;
+        let hist_usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        let (hist_buf, _) = GpuBuffer::new_mapped(allocator, hist_size, hist_usage)?;
+
+        self.sort_keys_a_buf = Some(keys_a);
+        self.sort_keys_b_buf = Some(keys_b);
+        self.sort_vals_a_buf = Some(vals_a);
+        self.sort_vals_b_buf = Some(vals_b);
+        self.sort_histogram_buf = Some(hist_buf);
+
+        self.sim_tick = 0;
         self.initialized = true;
         Ok(())
     }
@@ -560,6 +1053,287 @@ impl TrafficSim {
         }
 
         self.debug_descriptors_valid = true;
+
+        // --- Update sort key build descriptors ---
+        // Bindings: 0 car_road_id, 1 car_s, 2 car_lane, 3 road_lengths, 4 sort_keys_a, 5 sort_vals_a
+        let sort_keys_a = match &self.sort_keys_a_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let sort_keys_b = match &self.sort_keys_b_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let sort_vals_a = match &self.sort_vals_a_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let sort_vals_b = match &self.sort_vals_b_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let hist_buf = match &self.sort_histogram_buf {
+            Some(b) => b,
+            None => return,
+        };
+
+        {
+            let bufs = [
+                car_road_id,
+                car_s,
+                car_lane,
+                road_lengths,
+                sort_keys_a,
+                sort_vals_a,
+            ];
+            let buf_infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
+                .iter()
+                .map(|b| {
+                    [vk::DescriptorBufferInfo::builder()
+                        .buffer(b.buffer)
+                        .offset(0)
+                        .range(b.size)
+                        .build()]
+                })
+                .collect();
+            let writes: Vec<vk::WriteDescriptorSet> = buf_infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::builder()
+                        .dst_set(self.sort_keys_descriptor_set)
+                        .dst_binding(i as u32)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info)
+                        .build()
+                })
+                .collect();
+            unsafe {
+                device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
+            }
+        }
+
+        // --- Update sort histogram descriptors (2 sets: read A, read B) ---
+        {
+            // Set 0: keys_in = A, histograms
+            let bufs_a = [sort_keys_a, hist_buf];
+            let buf_infos_a: Vec<[vk::DescriptorBufferInfo; 1]> = bufs_a
+                .iter()
+                .map(|b| {
+                    [vk::DescriptorBufferInfo::builder()
+                        .buffer(b.buffer)
+                        .offset(0)
+                        .range(b.size)
+                        .build()]
+                })
+                .collect();
+            let writes_a: Vec<vk::WriteDescriptorSet> = buf_infos_a
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::builder()
+                        .dst_set(self.sort_histogram_descriptor_sets[0])
+                        .dst_binding(i as u32)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info)
+                        .build()
+                })
+                .collect();
+            unsafe {
+                device.update_descriptor_sets(&writes_a, &[] as &[vk::CopyDescriptorSet]);
+            }
+
+            // Set 1: keys_in = B, histograms
+            let bufs_b = [sort_keys_b, hist_buf];
+            let buf_infos_b: Vec<[vk::DescriptorBufferInfo; 1]> = bufs_b
+                .iter()
+                .map(|b| {
+                    [vk::DescriptorBufferInfo::builder()
+                        .buffer(b.buffer)
+                        .offset(0)
+                        .range(b.size)
+                        .build()]
+                })
+                .collect();
+            let writes_b: Vec<vk::WriteDescriptorSet> = buf_infos_b
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::builder()
+                        .dst_set(self.sort_histogram_descriptor_sets[1])
+                        .dst_binding(i as u32)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info)
+                        .build()
+                })
+                .collect();
+            unsafe {
+                device.update_descriptor_sets(&writes_b, &[] as &[vk::CopyDescriptorSet]);
+            }
+        }
+
+        // --- Update sort scan descriptor ---
+        {
+            let buf_info = [vk::DescriptorBufferInfo::builder()
+                .buffer(hist_buf.buffer)
+                .offset(0)
+                .range(hist_buf.size)
+                .build()];
+            let writes = [vk::WriteDescriptorSet::builder()
+                .dst_set(self.sort_scan_descriptor_set)
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&buf_info)
+                .build()];
+            unsafe {
+                device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
+            }
+        }
+
+        // --- Update sort scatter descriptors (2 sets: A→B, B→A) ---
+        {
+            // Set 0: read A, write B
+            let bufs_0 = [sort_keys_a, sort_vals_a, sort_keys_b, sort_vals_b, hist_buf];
+            let buf_infos_0: Vec<[vk::DescriptorBufferInfo; 1]> = bufs_0
+                .iter()
+                .map(|b| {
+                    [vk::DescriptorBufferInfo::builder()
+                        .buffer(b.buffer)
+                        .offset(0)
+                        .range(b.size)
+                        .build()]
+                })
+                .collect();
+            let writes_0: Vec<vk::WriteDescriptorSet> = buf_infos_0
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::builder()
+                        .dst_set(self.sort_scatter_descriptor_sets[0])
+                        .dst_binding(i as u32)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info)
+                        .build()
+                })
+                .collect();
+            unsafe {
+                device.update_descriptor_sets(&writes_0, &[] as &[vk::CopyDescriptorSet]);
+            }
+
+            // Set 1: read B, write A
+            let bufs_1 = [sort_keys_b, sort_vals_b, sort_keys_a, sort_vals_a, hist_buf];
+            let buf_infos_1: Vec<[vk::DescriptorBufferInfo; 1]> = bufs_1
+                .iter()
+                .map(|b| {
+                    [vk::DescriptorBufferInfo::builder()
+                        .buffer(b.buffer)
+                        .offset(0)
+                        .range(b.size)
+                        .build()]
+                })
+                .collect();
+            let writes_1: Vec<vk::WriteDescriptorSet> = buf_infos_1
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::builder()
+                        .dst_set(self.sort_scatter_descriptor_sets[1])
+                        .dst_binding(i as u32)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info)
+                        .build()
+                })
+                .collect();
+            unsafe {
+                device.update_descriptor_sets(&writes_1, &[] as &[vk::CopyDescriptorSet]);
+            }
+        }
+
+        // --- Update IDM descriptor set ---
+        // Bindings: 0-4 car SoA, 5 road_lengths, 6 sorted_indices (sort_vals_a after sort)
+        {
+            let bufs = [
+                car_road_id,
+                car_s,
+                car_lane,
+                car_speed,
+                car_desired,
+                road_lengths,
+                sort_vals_a, // After 4 passes: A→B→A→B→A, final sorted indices are in A
+            ];
+            let buf_infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
+                .iter()
+                .map(|b| {
+                    [vk::DescriptorBufferInfo::builder()
+                        .buffer(b.buffer)
+                        .offset(0)
+                        .range(b.size)
+                        .build()]
+                })
+                .collect();
+            let writes: Vec<vk::WriteDescriptorSet> = buf_infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::builder()
+                        .dst_set(self.idm_descriptor_set)
+                        .dst_binding(i as u32)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info)
+                        .build()
+                })
+                .collect();
+            unsafe {
+                device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
+            }
+        }
+
+        // --- Update MOBIL descriptor set ---
+        // Same layout as IDM: 0-4 car SoA, 5 road_lengths, 6 sorted_indices
+        {
+            let bufs = [
+                car_road_id,
+                car_s,
+                car_lane,
+                car_speed,
+                car_desired,
+                road_lengths,
+                sort_vals_a,
+            ];
+            let buf_infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
+                .iter()
+                .map(|b| {
+                    [vk::DescriptorBufferInfo::builder()
+                        .buffer(b.buffer)
+                        .offset(0)
+                        .range(b.size)
+                        .build()]
+                })
+                .collect();
+            let writes: Vec<vk::WriteDescriptorSet> = buf_infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::builder()
+                        .dst_set(self.mobil_descriptor_set)
+                        .dst_binding(i as u32)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info)
+                        .build()
+                })
+                .collect();
+            unsafe {
+                device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
+            }
+        }
     }
 
     fn destroy_buffers(&mut self, allocator: &engine::vma::Allocator) {
@@ -581,6 +1355,21 @@ impl TrafficSim {
         if let Some(b) = self.road_lengths_buf.take() {
             b.destroy(allocator);
         }
+        if let Some(b) = self.sort_keys_a_buf.take() {
+            b.destroy(allocator);
+        }
+        if let Some(b) = self.sort_keys_b_buf.take() {
+            b.destroy(allocator);
+        }
+        if let Some(b) = self.sort_vals_a_buf.take() {
+            b.destroy(allocator);
+        }
+        if let Some(b) = self.sort_vals_b_buf.take() {
+            b.destroy(allocator);
+        }
+        if let Some(b) = self.sort_histogram_buf.take() {
+            b.destroy(allocator);
+        }
     }
 
     fn destroy(&mut self, device: &engine::VkDevice, allocator: &engine::vma::Allocator) {
@@ -589,6 +1378,37 @@ impl TrafficSim {
             device.destroy_pipeline_layout(self.update_pipeline_layout, None);
             device.destroy_descriptor_pool(self.update_descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.update_descriptor_set_layout, None);
+
+            device.destroy_pipeline(self.sort_keys_pipeline, None);
+            device.destroy_pipeline_layout(self.sort_keys_pipeline_layout, None);
+            device.destroy_descriptor_pool(self.sort_keys_descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.sort_keys_descriptor_set_layout, None);
+
+            device.destroy_pipeline(self.sort_histogram_pipeline, None);
+            device.destroy_pipeline_layout(self.sort_histogram_pipeline_layout, None);
+            device.destroy_descriptor_pool(self.sort_histogram_descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.sort_histogram_descriptor_set_layout, None);
+
+            device.destroy_pipeline(self.sort_scan_pipeline, None);
+            device.destroy_pipeline_layout(self.sort_scan_pipeline_layout, None);
+            device.destroy_descriptor_pool(self.sort_scan_descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.sort_scan_descriptor_set_layout, None);
+
+            device.destroy_pipeline(self.sort_scatter_pipeline, None);
+            device.destroy_pipeline_layout(self.sort_scatter_pipeline_layout, None);
+            device.destroy_descriptor_pool(self.sort_scatter_descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.sort_scatter_descriptor_set_layout, None);
+
+            device.destroy_pipeline(self.idm_pipeline, None);
+            device.destroy_pipeline_layout(self.idm_pipeline_layout, None);
+            device.destroy_descriptor_pool(self.idm_descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.idm_descriptor_set_layout, None);
+
+            device.destroy_pipeline(self.mobil_pipeline, None);
+            device.destroy_pipeline_layout(self.mobil_pipeline_layout, None);
+            device.destroy_descriptor_pool(self.mobil_descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.mobil_descriptor_set_layout, None);
+
             device.destroy_pipeline(self.debug_pipeline, None);
             device.destroy_pipeline_layout(self.debug_pipeline_layout, None);
             device.destroy_descriptor_pool(self.debug_descriptor_pool, None);
@@ -990,8 +1810,8 @@ impl TrafficApp {
 
         // Sampler for SDF atlas
         let sampler_info = vk::SamplerCreateInfo::builder()
-            .mag_filter(vk::Filter::NEAREST)
-            .min_filter(vk::Filter::NEAREST)
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE);
         self.road_render_sampler = unsafe { device.create_sampler(&sampler_info, None)? };
@@ -1482,7 +2302,24 @@ impl App for TrafficApp {
             self.update_road_render_descriptors(ctx);
 
             // Initialize/reinitialize traffic cars on road change
-            let cars_per_road = 1000u32; // Start with 1000 per road for debugging
+            // Compute density-aware car count: target ~1 car per 60m per lane
+            // (ensures IDM gaps of ~55m which is above the desired s* at 30 m/s)
+            let cars_per_road = {
+                let mut total = 0u32;
+                for road_data in &self.network.roads {
+                    let road_len = road_data.reference_line.total_length;
+                    let lane_count = if road_data.lane_sections.is_empty() {
+                        1u32
+                    } else {
+                        let sec = &road_data.lane_sections[0];
+                        (sec.right_lanes.len() + sec.left_lanes.len()) as u32
+                    };
+                    // Target spacing: 60m per car (car_length 4.5 + IDM gap ~55m)
+                    let cars_this_road = ((road_len / 60.0) as u32) * lane_count;
+                    total += cars_this_road.max(1);
+                }
+                total / self.network.roads.len().max(1) as u32
+            };
             self.traffic
                 .initialize_cars(ctx.allocator, &self.network, cars_per_road)?;
             self.traffic.update_descriptors(
@@ -1564,51 +2401,278 @@ impl App for TrafficApp {
         }
 
         // --- Compute: traffic simulation update (fixed timestep) ---
+        // Phase 8: Sort → IDM → MOBIL (replaces simple s += v*dt)
         if self.traffic.initialized && self.traffic.car_count > 0 {
             self.traffic.sim_accumulator += ctx.dt;
-            while self.traffic.sim_accumulator >= SIM_DT {
+            // Cap to max 2 ticks per frame to avoid overloading the command buffer
+            let max_ticks = 2;
+            let mut ticks_this_frame = 0u32;
+            while self.traffic.sim_accumulator >= SIM_DT && ticks_this_frame < max_ticks {
                 self.traffic.sim_accumulator -= SIM_DT;
+                self.traffic.sim_tick += 1;
+                ticks_this_frame += 1;
+
+                let car_count = self.traffic.car_count;
+                let num_sort_wg = (car_count + SORT_TILE_SIZE - 1) / SORT_TILE_SIZE;
 
                 unsafe {
+                    // === Step 1: Build sort keys ===
                     device.cmd_bind_pipeline(
                         cmd,
                         vk::PipelineBindPoint::COMPUTE,
-                        self.traffic.update_pipeline,
+                        self.traffic.sort_keys_pipeline,
                     );
                     device.cmd_bind_descriptor_sets(
                         cmd,
                         vk::PipelineBindPoint::COMPUTE,
-                        self.traffic.update_pipeline_layout,
+                        self.traffic.sort_keys_pipeline_layout,
                         0,
-                        &[self.traffic.update_descriptor_set],
+                        &[self.traffic.sort_keys_descriptor_set],
                         &[],
                     );
-
-                    let pc = TrafficUpdatePushConstants {
-                        dt: SIM_DT,
-                        car_count: self.traffic.car_count,
+                    let keys_pc = SortKeysPushConstants {
+                        car_count,
+                        _pad0: 0,
+                        _pad1: 0,
+                        _pad2: 0,
                     };
                     device.cmd_push_constants(
                         cmd,
-                        self.traffic.update_pipeline_layout,
+                        self.traffic.sort_keys_pipeline_layout,
                         vk::ShaderStageFlags::COMPUTE,
                         0,
-                        bytemuck::bytes_of(&pc),
+                        bytemuck::bytes_of(&keys_pc),
                     );
+                    device.cmd_dispatch(cmd, num_sort_wg, 1, 1);
 
-                    let wg = (self.traffic.car_count + 255) / 256;
-                    device.cmd_dispatch(cmd, wg, 1, 1);
-
-                    // Barrier: compute writes → vertex reads
+                    // Barrier: keys written → histogram reads
                     let barrier = vk::MemoryBarrier2::builder()
+                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(
+                            vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                        );
+                    let dep = vk::DependencyInfo::builder()
+                        .memory_barriers(std::slice::from_ref(&barrier));
+                    device.cmd_pipeline_barrier2(cmd, &dep);
+
+                    // === Step 2: Radix sort (4 passes of 8 bits) ===
+                    let hist_buf = self.traffic.sort_histogram_buf.as_ref().unwrap();
+                    let hist_buf_size = hist_buf.size;
+                    let hist_buffer = hist_buf.buffer;
+
+                    for pass in 0u32..4 {
+                        // Which descriptor sets to use:
+                        // Even passes (0, 2): read from A (set index 0), scatter A→B (set index 0)
+                        // Odd passes (1, 3): read from B (set index 1), scatter B→A (set index 1)
+                        let set_idx = (pass % 2) as usize;
+
+                        // Zero histogram buffer before each pass
+                        device.cmd_fill_buffer(cmd, hist_buffer, 0, hist_buf_size, 0);
+                        let fill_barrier = vk::MemoryBarrier2::builder()
+                            .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(
+                                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                            );
+                        let fill_dep = vk::DependencyInfo::builder()
+                            .memory_barriers(std::slice::from_ref(&fill_barrier));
+                        device.cmd_pipeline_barrier2(cmd, &fill_dep);
+
+                        // --- Histogram ---
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.traffic.sort_histogram_pipeline,
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.traffic.sort_histogram_pipeline_layout,
+                            0,
+                            &[self.traffic.sort_histogram_descriptor_sets[set_idx]],
+                            &[],
+                        );
+                        let hist_pc = SortHistogramPushConstants {
+                            pass_id: pass,
+                            car_count,
+                            num_workgroups: num_sort_wg,
+                            _pad: 0,
+                        };
+                        device.cmd_push_constants(
+                            cmd,
+                            self.traffic.sort_histogram_pipeline_layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            bytemuck::bytes_of(&hist_pc),
+                        );
+                        device.cmd_dispatch(cmd, num_sort_wg, 1, 1);
+
+                        // Barrier: histogram written → scan reads
+                        device.cmd_pipeline_barrier2(cmd, &dep);
+
+                        // --- Prefix sum (scan) ---
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.traffic.sort_scan_pipeline,
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.traffic.sort_scan_pipeline_layout,
+                            0,
+                            &[self.traffic.sort_scan_descriptor_set],
+                            &[],
+                        );
+                        let scan_pc = SortScanPushConstants {
+                            num_workgroups: num_sort_wg,
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        };
+                        device.cmd_push_constants(
+                            cmd,
+                            self.traffic.sort_scan_pipeline_layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            bytemuck::bytes_of(&scan_pc),
+                        );
+                        // 1 workgroup: single thread processes all 256 digit rows
+                        device.cmd_dispatch(cmd, 1, 1, 1);
+
+                        // Barrier: scan written → scatter reads
+                        device.cmd_pipeline_barrier2(cmd, &dep);
+
+                        // --- Scatter ---
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.traffic.sort_scatter_pipeline,
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.traffic.sort_scatter_pipeline_layout,
+                            0,
+                            &[self.traffic.sort_scatter_descriptor_sets[set_idx]],
+                            &[],
+                        );
+                        let scatter_pc = SortScatterPushConstants {
+                            pass_id: pass,
+                            car_count,
+                            num_workgroups: num_sort_wg,
+                            _pad: 0,
+                        };
+                        device.cmd_push_constants(
+                            cmd,
+                            self.traffic.sort_scatter_pipeline_layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            bytemuck::bytes_of(&scatter_pc),
+                        );
+                        device.cmd_dispatch(cmd, num_sort_wg, 1, 1);
+
+                        // Barrier between passes
+                        device.cmd_pipeline_barrier2(cmd, &dep);
+                    }
+                    // After 4 passes: sorted result is in buffer A
+                    // (pass 0: A→B, pass 1: B→A, pass 2: A→B, pass 3: B→A → final in A)
+
+                    // === Step 3: IDM car-following ===
+                    device.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.traffic.idm_pipeline,
+                    );
+                    device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.traffic.idm_pipeline_layout,
+                        0,
+                        &[self.traffic.idm_descriptor_set],
+                        &[],
+                    );
+                    let idm_pc = IdmPushConstants {
+                        dt: SIM_DT,
+                        car_count,
+                        a_max: 1.5,
+                        b_comfort: 2.0,
+                        s0: 2.0,
+                        time_headway: 1.5,
+                        car_length: 4.5,
+                        _pad: 0,
+                    };
+                    device.cmd_push_constants(
+                        cmd,
+                        self.traffic.idm_pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        bytemuck::bytes_of(&idm_pc),
+                    );
+                    device.cmd_dispatch(cmd, (car_count + 255) / 256, 1, 1);
+
+                    // Barrier: IDM writes → MOBIL reads (or vertex reads)
+                    device.cmd_pipeline_barrier2(cmd, &dep);
+
+                    // === Step 4: MOBIL lane change (every Nth tick) ===
+                    if self.traffic.sim_tick % LANE_CHANGE_INTERVAL == 0 {
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.traffic.mobil_pipeline,
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.traffic.mobil_pipeline_layout,
+                            0,
+                            &[self.traffic.mobil_descriptor_set],
+                            &[],
+                        );
+                        let mobil_pc = MobilPushConstants {
+                            car_count,
+                            a_max: 1.5,
+                            b_comfort: 2.0,
+                            s0: 2.0,
+                            time_headway: 1.5,
+                            car_length: 4.5,
+                            politeness: 0.5,
+                            threshold: 0.5,
+                            b_safe: 4.0,
+                            max_right_lanes: 2,          // 2 right lanes (0, 1)
+                            max_left_lanes: 2,           // 2 left lanes (-1, -2)
+                            _pad: self.traffic.sim_tick, // stagger phase: car_idx % 4 == tick % 4
+                        };
+                        device.cmd_push_constants(
+                            cmd,
+                            self.traffic.mobil_pipeline_layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            bytemuck::bytes_of(&mobil_pc),
+                        );
+                        device.cmd_dispatch(cmd, (car_count + 255) / 256, 1, 1);
+
+                        // Barrier: MOBIL writes → next iteration reads
+                        device.cmd_pipeline_barrier2(cmd, &dep);
+                    }
+
+                    // Final barrier: compute writes → vertex shader reads
+                    let final_barrier = vk::MemoryBarrier2::builder()
                         .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                         .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
                         .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_SHADER)
                         .dst_access_mask(vk::AccessFlags2::SHADER_READ);
-                    let dep = vk::DependencyInfo::builder()
-                        .memory_barriers(std::slice::from_ref(&barrier));
-                    device.cmd_pipeline_barrier2(cmd, &dep);
+                    let final_dep = vk::DependencyInfo::builder()
+                        .memory_barriers(std::slice::from_ref(&final_barrier));
+                    device.cmd_pipeline_barrier2(cmd, &final_dep);
                 }
+            }
+            // Clamp accumulator to prevent unbounded growth
+            if self.traffic.sim_accumulator > SIM_DT * 4.0 {
+                self.traffic.sim_accumulator = 0.0;
             }
         }
 
@@ -1680,15 +2744,19 @@ impl App for TrafficApp {
                             &[],
                         );
 
-                        let atlas_tiles = 16u32;
+                        let atlas_tiles = ATLAS_TILES;
                         let atlas_size_f = (atlas_tiles * TILE_RESOLUTION) as f32;
+                        // Half-texel inset to prevent bilinear bleed across tile boundaries
+                        let half_texel = 0.5 / atlas_size_f;
 
                         for (key, info) in &sdf.tile_map.tiles {
                             let slot_x = info.atlas_slot % atlas_tiles;
                             let slot_y = info.atlas_slot / atlas_tiles;
-                            let uv_offset_x = (slot_x * TILE_RESOLUTION) as f32 / atlas_size_f;
-                            let uv_offset_y = (slot_y * TILE_RESOLUTION) as f32 / atlas_size_f;
-                            let uv_scale = TILE_RESOLUTION as f32 / atlas_size_f;
+                            let uv_offset_x =
+                                (slot_x * TILE_RESOLUTION) as f32 / atlas_size_f + half_texel;
+                            let uv_offset_y =
+                                (slot_y * TILE_RESOLUTION) as f32 / atlas_size_f + half_texel;
+                            let uv_scale = TILE_RESOLUTION as f32 / atlas_size_f - 2.0 * half_texel;
 
                             let (wx, wy) = key.world_origin();
 

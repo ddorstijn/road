@@ -18,10 +18,10 @@ use crate::pipeline::{
 pub const TILE_SIZE: f32 = 64.0;
 /// Texels per tile dimension.
 pub const TILE_RESOLUTION: u32 = 256;
-/// Atlas dimension in tiles (16 × 16 = 256 tile slots).
-const ATLAS_TILES: u32 = 16;
+/// Atlas dimension in tiles (32 × 32 = 1024 tile slots).
+pub const ATLAS_TILES: u32 = 32;
 /// Atlas dimension in texels.
-const ATLAS_SIZE: u32 = ATLAS_TILES * TILE_RESOLUTION; // 4096
+const ATLAS_SIZE: u32 = ATLAS_TILES * TILE_RESOLUTION; // 8192
 
 // ---------------------------------------------------------------------------
 // Push constants — must match the shader
@@ -118,10 +118,7 @@ impl TileMap {
     /// Rebuild tile data from road segments.
     /// `segments` is the flat array of (origin, heading, length, segment_index, road_index)
     /// tuples — we compute AABB overlap with each tile.
-    pub fn rebuild(
-        &mut self,
-        segment_data: &[SegmentAABB],
-    ) {
+    pub fn rebuild(&mut self, segment_data: &[SegmentAABB]) {
         // Clear old data
         let old_keys: Vec<TileKey> = self.tiles.keys().cloned().collect();
         for key in &old_keys {
@@ -175,10 +172,13 @@ impl TileMap {
             }
 
             self.headers.push(TileHeader { offset, count });
-            self.tiles.insert(*key, TileInfo {
-                atlas_slot: slot,
-                header_index,
-            });
+            self.tiles.insert(
+                *key,
+                TileInfo {
+                    atlas_slot: slot,
+                    header_index,
+                },
+            );
             self.dirty_tiles.insert(*key);
         }
     }
@@ -225,13 +225,13 @@ impl SdfTileManager {
         road_eval_wgsl: &str,
         sdf_gen_wgsl: &str,
     ) -> anyhow::Result<Self> {
-        // Create atlas image (RGBA32F for signed_dist, s, road_id, unused)
+        // Create atlas image (RGBA16F for signed_dist, s, road_id, unused)
         let atlas = GpuImage::new_storage_2d(
             device,
             allocator,
             ATLAS_SIZE,
             ATLAS_SIZE,
-            vk::Format::R32G32B32A32_SFLOAT,
+            vk::Format::R16G16B16A16_SFLOAT,
         )?;
 
         // Compose the full WGSL source by concatenating shared modules
@@ -471,11 +471,7 @@ impl SdfTileManager {
 
     /// Record compute dispatches for all dirty tiles. Call this during command
     /// buffer recording. The atlas image must be in GENERAL layout.
-    pub fn dispatch_dirty_tiles(
-        &mut self,
-        device: &Device,
-        cmd: vk::CommandBuffer,
-    ) {
+    pub fn dispatch_dirty_tiles(&mut self, device: &Device, cmd: vk::CommandBuffer) {
         if self.tile_map.dirty_tiles.is_empty() {
             return;
         }
@@ -568,9 +564,7 @@ impl SdfTileManager {
 /// Compute world-space AABBs for all segments across all roads.
 /// Uses a conservative estimate by sampling the segment at multiple points
 /// and adding a margin for road width.
-pub fn compute_segment_aabbs(
-    roads: &[crate::sdf::RoadSegmentInfo],
-) -> Vec<SegmentAABB> {
+pub fn compute_segment_aabbs(roads: &[crate::sdf::RoadSegmentInfo]) -> Vec<SegmentAABB> {
     let margin = 20.0; // generous margin for road width + shoulder
 
     let mut result = Vec::new();
