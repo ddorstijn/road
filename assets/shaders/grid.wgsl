@@ -28,13 +28,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // Background color
     var color = vec3<f32>(0.08, 0.08, 0.12);
 
-    // Grid parameters: choose spacing based on zoom
-    // Major grid every 10 units, minor grid every 1 unit
-    let minor_spacing = 1.0;
-    let major_spacing = 10.0;
+    // Compute world-space size of one pixel.
+    // inv_vp column 1 maps NDC y → world. Its length = half the view height in world units.
+    let half_view_h = length(vec2<f32>(camera.inv_vp[1][0], camera.inv_vp[1][1]));
+    let pixel_world_size = 2.0 * half_view_h / f32(size.y);
 
-    // Compute pixel size in world units (approx) for anti-aliasing
-    let pixel_world_size = 2.0 / (f32(size.y) * length(vec2<f32>(camera.inv_vp[1][0], camera.inv_vp[1][1])));
+    // Adaptive grid: choose spacing so lines are always visible.
+    // Target: at least ~8 pixels between grid lines.
+    let min_world_gap = pixel_world_size * 8.0;
+
+    // Pick power-of-10 spacings that are large enough to be visible
+    let log_gap = log2(min_world_gap) / log2(10.0);
+    let minor_exp = ceil(log_gap);
+    let minor_spacing = pow(10.0, minor_exp);
+    let major_spacing = minor_spacing * 10.0;
 
     // Minor grid lines
     let minor_x = abs(fract(world.x / minor_spacing + 0.5) - 0.5) * minor_spacing;
@@ -50,14 +57,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let major_line = 1.0 - smoothstep(0.0, pixel_world_size * 2.0, major_dist);
     color = mix(color, vec3<f32>(0.4, 0.4, 0.5), major_line * 0.7);
 
-    // Axis lines (X = red, Y = green)
+    // Axis lines (X = red, Y = green) — always 3 pixels thick
     let axis_x = abs(world.y);
     let axis_y = abs(world.x);
-    let axis_thickness = pixel_world_size * 2.0;
+    let axis_thickness = pixel_world_size * 3.0;
     let x_axis = 1.0 - smoothstep(0.0, axis_thickness, axis_x);
     let y_axis = 1.0 - smoothstep(0.0, axis_thickness, axis_y);
-    color = mix(color, vec3<f32>(0.8, 0.2, 0.2), x_axis * 0.8);
-    color = mix(color, vec3<f32>(0.2, 0.8, 0.2), y_axis * 0.8);
+    color = mix(color, vec3<f32>(0.8, 0.2, 0.2), x_axis * 0.9);
+    color = mix(color, vec3<f32>(0.2, 0.8, 0.2), y_axis * 0.9);
 
     textureStore(output, vec2<i32>(id.xy), vec4<f32>(color, 1.0));
 }

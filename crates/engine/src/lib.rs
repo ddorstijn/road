@@ -80,6 +80,8 @@ pub struct InputState {
     pub left_mouse_pressed: bool,
     /// True for one frame when right mouse was just pressed.
     pub right_mouse_pressed: bool,
+    /// True for one frame when Escape was just pressed.
+    pub escape_pressed: bool,
 }
 
 impl InputState {
@@ -89,6 +91,7 @@ impl InputState {
         self.scroll_delta = 0.0;
         self.left_mouse_pressed = false;
         self.right_mouse_pressed = false;
+        self.escape_pressed = false;
     }
 }
 
@@ -225,6 +228,15 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 100.0,
                 };
+            }
+
+            WindowEvent::KeyboardInput { event, .. } => {
+                use winit::keyboard::{Key, NamedKey};
+                if event.state == ElementState::Pressed {
+                    if event.logical_key == Key::Named(NamedKey::Escape) {
+                        self.input.escape_pressed = true;
+                    }
+                }
             }
 
             WindowEvent::RedrawRequested => {

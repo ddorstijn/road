@@ -9,4 +9,5 @@ bytemuck = { version = "1.25", features = ["derive"] }
 engine = { path = "../../crates/engine" }
 glam = "0.32"
 log = "0.4"
+rand = "0.9"
 road = { path = "../../crates/road" }
