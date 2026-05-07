@@ -3,6 +3,9 @@ use engine::pipeline::{
     GraphicsPipelineDesc, allocate_descriptor_set, compile_wgsl, create_compute_pipeline,
     create_descriptor_set_layout, create_graphics_pipeline,
 };
+use engine::sdf::{
+    RoadSegmentInfo, SdfTileManager, TILE_RESOLUTION, TILE_SIZE, compute_segment_aabbs,
+};
 use engine::vk::{DeviceV1_0, DeviceV1_3, Handle, HasBuilder};
 use engine::{App, EngineContext, transition_image, vk};
 use glam::Vec2;
@@ -12,6 +15,10 @@ use road::network::RoadNetwork;
 
 const GRID_SHADER: &str = include_str!("../../../assets/shaders/grid.wgsl");
 const ROAD_LINE_SHADER: &str = include_str!("../../../assets/shaders/road_line.wgsl");
+const SDF_TYPES_WGSL: &str = include_str!("../../../assets/shaders/shared/types.wgsl");
+const SDF_ROAD_EVAL_WGSL: &str = include_str!("../../../assets/shaders/shared/road_eval.wgsl");
+const SDF_GENERATE_WGSL: &str = include_str!("../../../assets/shaders/sdf_generate.wgsl");
+const SDF_DEBUG_WGSL: &str = include_str!("../../../assets/shaders/sdf_debug.wgsl");
 
 // ---------------------------------------------------------------------------
 // GPU data structs (SSBOs for later phases)
@@ -88,6 +95,20 @@ struct LinePushConstants {
 struct DrawRange {
     first_vertex: u32,
     vertex_count: u32,
+}
+
+// ---------------------------------------------------------------------------
+// SDF debug visualization push constants
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SdfDebugPushConstants {
+    view_proj: [[f32; 4]; 4],
+    atlas_uv_offset: [f32; 2],
+    atlas_uv_scale: [f32; 2],
+    tile_world_origin: [f32; 2],
+    tile_world_size: [f32; 2],
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +288,17 @@ struct TrafficApp {
 
     // GPU road data (SSBOs)
     gpu_road_data: GpuRoadData,
+
+    // SDF tile system
+    sdf_manager: Option<SdfTileManager>,
+
+    // SDF debug visualization
+    sdf_debug_pipeline: vk::Pipeline,
+    sdf_debug_pipeline_layout: vk::PipelineLayout,
+    sdf_debug_descriptor_set_layout: vk::DescriptorSetLayout,
+    sdf_debug_descriptor_pool: vk::DescriptorPool,
+    sdf_debug_descriptor_set: vk::DescriptorSet,
+    sdf_debug_sampler: vk::Sampler,
 }
 
 impl Default for TrafficApp {
@@ -293,6 +325,15 @@ impl Default for TrafficApp {
             cp_draw: None,
 
             gpu_road_data: GpuRoadData::new(),
+
+            sdf_manager: None,
+
+            sdf_debug_pipeline: vk::Pipeline::null(),
+            sdf_debug_pipeline_layout: vk::PipelineLayout::null(),
+            sdf_debug_descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            sdf_debug_descriptor_pool: vk::DescriptorPool::null(),
+            sdf_debug_descriptor_set: vk::DescriptorSet::null(),
+            sdf_debug_sampler: vk::Sampler::null(),
         }
     }
 }
@@ -418,6 +459,180 @@ impl TrafficApp {
             ctx.device
                 .update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
         }
+    }
+
+    fn create_sdf_system(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
+        let device = ctx.device.as_ref();
+
+        // Create SDF tile manager
+        let sdf_manager = SdfTileManager::new(
+            ctx.device,
+            ctx.allocator,
+            SDF_TYPES_WGSL,
+            SDF_ROAD_EVAL_WGSL,
+            SDF_GENERATE_WGSL,
+        )?;
+
+        // Create SDF debug visualization pipeline
+        let spirv = compile_wgsl(SDF_DEBUG_WGSL)?;
+
+        // Sampler for SDF atlas
+        let sampler_info = vk::SamplerCreateInfo::builder()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        self.sdf_debug_sampler = unsafe { device.create_sampler(&sampler_info, None)? };
+
+        // Descriptor: binding 0 = sampled image, binding 1 = sampler
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+        ];
+        self.sdf_debug_descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
+
+        let pool_sizes = [
+            vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .build(),
+            vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .build(),
+        ];
+        let pool_info = vk::DescriptorPoolCreateInfo::builder()
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        self.sdf_debug_descriptor_pool =
+            unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+        self.sdf_debug_descriptor_set = allocate_descriptor_set(
+            device,
+            self.sdf_debug_descriptor_pool,
+            self.sdf_debug_descriptor_set_layout,
+        )?;
+
+        // Write descriptor for atlas image + sampler
+        let image_info = [vk::DescriptorImageInfo::builder()
+            .image_view(sdf_manager.atlas.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .build()];
+        let sampler_info_desc = [vk::DescriptorImageInfo::builder()
+            .sampler(self.sdf_debug_sampler)
+            .build()];
+        let writes = [
+            vk::WriteDescriptorSet::builder()
+                .dst_set(self.sdf_debug_descriptor_set)
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&image_info)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(self.sdf_debug_descriptor_set)
+                .dst_binding(1)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&sampler_info_desc)
+                .build(),
+        ];
+        unsafe {
+            device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
+        }
+
+        // Graphics pipeline for debug quads
+        let push_constant_ranges = [vk::PushConstantRange::builder()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(std::mem::size_of::<SdfDebugPushConstants>() as u32)
+            .build()];
+
+        let desc = GraphicsPipelineDesc {
+            vertex_spirv: &spirv,
+            fragment_spirv: &spirv,
+            vertex_entry: "vs_main",
+            fragment_entry: "fs_main",
+            vertex_binding_descriptions: &[],
+            vertex_attribute_descriptions: &[],
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            color_attachment_format: ctx.draw_image.format,
+            push_constant_ranges: &push_constant_ranges,
+            descriptor_set_layouts: &[self.sdf_debug_descriptor_set_layout],
+            line_width: 1.0,
+        };
+
+        let (pipeline, layout) = create_graphics_pipeline(device, &desc)?;
+        self.sdf_debug_pipeline = pipeline;
+        self.sdf_debug_pipeline_layout = layout;
+
+        self.sdf_manager = Some(sdf_manager);
+        Ok(())
+    }
+
+    /// Rebuild tile map data from current road network and upload to GPU.
+    fn rebuild_sdf_tiles(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
+        let sdf = match self.sdf_manager.as_mut() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        // Build segment info from road network
+        let mut seg_infos = Vec::new();
+        for (road_idx, road_data) in self.network.roads.iter().enumerate() {
+            let rl = &road_data.reference_line;
+            for (seg_idx, seg) in rl.segments.iter().enumerate() {
+                let (seg_type, k_start, k_end) = match seg {
+                    road::primitives::Segment::Line { .. } => (0u32, 0.0f32, 0.0f32),
+                    road::primitives::Segment::Arc { curvature, .. } => (1, *curvature, *curvature),
+                    road::primitives::Segment::Spiral { k_start, k_end, .. } => {
+                        (2, *k_start, *k_end)
+                    }
+                };
+
+                seg_infos.push(RoadSegmentInfo {
+                    segment_index: seg_idx as u32
+                        + self.network.roads[..road_idx]
+                            .iter()
+                            .map(|r| r.reference_line.segments.len() as u32)
+                            .sum::<u32>(),
+                    road_index: road_idx as u32,
+                    seg_type,
+                    origin_x: rl.origins[seg_idx].x,
+                    origin_y: rl.origins[seg_idx].y,
+                    heading: rl.headings[seg_idx],
+                    length: seg.length(),
+                    k_start,
+                    k_end,
+                });
+            }
+        }
+
+        // Compute AABBs and rebuild tile map
+        let aabbs = compute_segment_aabbs(&seg_infos);
+        sdf.tile_map.rebuild(&aabbs);
+
+        // Upload tile data to GPU
+        if let Some(seg_buf) = &self.gpu_road_data.segment_buffer {
+            sdf.upload_tile_data(
+                ctx.device.as_ref(),
+                ctx.allocator,
+                seg_buf.buffer,
+                seg_buf.size,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Rebuild the polyline vertex buffer from current road state.
@@ -618,6 +833,7 @@ impl App for TrafficApp {
     fn init(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
         self.create_grid_pipeline(ctx)?;
         self.create_line_pipeline(ctx)?;
+        self.create_sdf_system(ctx)?;
         Ok(())
     }
 
@@ -638,7 +854,45 @@ impl App for TrafficApp {
         // Upload GPU road data if dirty
         if self.dirty {
             self.gpu_road_data.upload(ctx.allocator, &self.network)?;
+            self.rebuild_sdf_tiles(ctx)?;
             self.dirty = false;
+        }
+
+        // --- Compute: SDF tile generation (dirty tiles only) ---
+        if let Some(sdf) = &mut self.sdf_manager {
+            if sdf.has_dirty_tiles() {
+                // Transition SDF atlas to GENERAL for compute write
+                transition_image(
+                    device,
+                    cmd,
+                    sdf.atlas.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                );
+
+                sdf.dispatch_dirty_tiles(device, cmd);
+
+                // Memory barrier: compute writes → fragment reads
+                unsafe {
+                    let barrier = vk::MemoryBarrier2::builder()
+                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_READ);
+                    let dep = vk::DependencyInfo::builder()
+                        .memory_barriers(std::slice::from_ref(&barrier));
+                    device.cmd_pipeline_barrier2(cmd, &dep);
+                }
+
+                // Transition atlas to shader read for debug vis
+                transition_image(
+                    device,
+                    cmd,
+                    sdf.atlas.image,
+                    vk::ImageLayout::GENERAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+            }
         }
 
         // --- Compute: grid background ---
@@ -671,8 +925,8 @@ impl App for TrafficApp {
             device.cmd_dispatch(cmd, wg_x, wg_y, 1);
         }
 
-        // --- Graphics: road polylines ---
-        if self.polyline_buffer.is_some() {
+        // --- Graphics: SDF debug visualization + road polylines ---
+        {
             transition_image(
                 device,
                 cmd,
@@ -719,41 +973,99 @@ impl App for TrafficApp {
                 );
                 device.cmd_set_scissor(cmd, 0, &[*scissor]);
 
-                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.line_pipeline);
-
                 let aspect = ctx.window_width as f32 / ctx.window_height as f32;
                 let vp = ctx.camera.view_projection(aspect);
-                let pc = LinePushConstants {
-                    view_proj: vp.to_cols_array_2d(),
-                };
-                device.cmd_push_constants(
-                    cmd,
-                    self.line_pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    bytemuck::bytes_of(&pc),
-                );
 
-                let vb = self.polyline_buffer.as_ref().unwrap();
-                device.cmd_bind_vertex_buffers(cmd, 0, &[vb.buffer], &[0]);
+                // --- Draw SDF debug tiles ---
+                if let Some(sdf) = &self.sdf_manager {
+                    if !sdf.tile_map.tiles.is_empty() {
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.sdf_debug_pipeline,
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.sdf_debug_pipeline_layout,
+                            0,
+                            &[self.sdf_debug_descriptor_set],
+                            &[],
+                        );
 
-                // Draw finalized roads (LINE_STRIP per road)
-                for draw in &self.road_draws {
-                    device.cmd_draw(cmd, draw.vertex_count, 1, draw.first_vertex, 0);
+                        let atlas_tiles = 16u32;
+                        let atlas_size_f = (atlas_tiles * TILE_RESOLUTION) as f32;
+
+                        for (key, info) in &sdf.tile_map.tiles {
+                            let slot_x = info.atlas_slot % atlas_tiles;
+                            let slot_y = info.atlas_slot / atlas_tiles;
+                            let uv_offset_x = (slot_x * TILE_RESOLUTION) as f32 / atlas_size_f;
+                            let uv_offset_y = (slot_y * TILE_RESOLUTION) as f32 / atlas_size_f;
+                            let uv_scale = TILE_RESOLUTION as f32 / atlas_size_f;
+
+                            let (wx, wy) = key.world_origin();
+
+                            let pc = SdfDebugPushConstants {
+                                view_proj: vp.to_cols_array_2d(),
+                                atlas_uv_offset: [uv_offset_x, uv_offset_y],
+                                atlas_uv_scale: [uv_scale, uv_scale],
+                                tile_world_origin: [wx, wy],
+                                tile_world_size: [TILE_SIZE, TILE_SIZE],
+                            };
+
+                            device.cmd_push_constants(
+                                cmd,
+                                self.sdf_debug_pipeline_layout,
+                                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                                0,
+                                bytemuck::bytes_of(&pc),
+                            );
+
+                            device.cmd_draw(cmd, 6, 1, 0, 0);
+                        }
+                    }
                 }
 
-                // Draw pending road
-                if let Some(ref draw) = self.pending_draw {
-                    device.cmd_draw(cmd, draw.vertex_count, 1, draw.first_vertex, 0);
-                }
+                // --- Draw road polylines ---
+                if self.polyline_buffer.is_some() {
+                    device.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.line_pipeline,
+                    );
 
-                // Draw control point crosses (pairs of 2 vertices)
-                if let Some(ref draw) = self.cp_draw {
-                    let mut v = draw.first_vertex;
-                    let end = draw.first_vertex + draw.vertex_count;
-                    while v + 1 < end {
-                        device.cmd_draw(cmd, 2, 1, v, 0);
-                        v += 2;
+                    let pc = LinePushConstants {
+                        view_proj: vp.to_cols_array_2d(),
+                    };
+                    device.cmd_push_constants(
+                        cmd,
+                        self.line_pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX,
+                        0,
+                        bytemuck::bytes_of(&pc),
+                    );
+
+                    let vb = self.polyline_buffer.as_ref().unwrap();
+                    device.cmd_bind_vertex_buffers(cmd, 0, &[vb.buffer], &[0]);
+
+                    // Draw finalized roads (LINE_STRIP per road)
+                    for draw in &self.road_draws {
+                        device.cmd_draw(cmd, draw.vertex_count, 1, draw.first_vertex, 0);
+                    }
+
+                    // Draw pending road
+                    if let Some(ref draw) = self.pending_draw {
+                        device.cmd_draw(cmd, draw.vertex_count, 1, draw.first_vertex, 0);
+                    }
+
+                    // Draw control point crosses (pairs of 2 vertices)
+                    if let Some(ref draw) = self.cp_draw {
+                        let mut v = draw.first_vertex;
+                        let end = draw.first_vertex + draw.vertex_count;
+                        while v + 1 < end {
+                            device.cmd_draw(cmd, 2, 1, v, 0);
+                            v += 2;
+                        }
                     }
                 }
 
@@ -784,6 +1096,14 @@ impl App for TrafficApp {
             ctx.device.destroy_pipeline(self.line_pipeline, None);
             ctx.device
                 .destroy_pipeline_layout(self.line_pipeline_layout, None);
+            ctx.device.destroy_pipeline(self.sdf_debug_pipeline, None);
+            ctx.device
+                .destroy_pipeline_layout(self.sdf_debug_pipeline_layout, None);
+            ctx.device
+                .destroy_descriptor_pool(self.sdf_debug_descriptor_pool, None);
+            ctx.device
+                .destroy_descriptor_set_layout(self.sdf_debug_descriptor_set_layout, None);
+            ctx.device.destroy_sampler(self.sdf_debug_sampler, None);
         }
         if let Some(b) = self.polyline_buffer.take() {
             b.destroy(ctx.allocator);
@@ -792,6 +1112,9 @@ impl App for TrafficApp {
             b.destroy(ctx.allocator);
         }
         self.gpu_road_data.destroy(ctx.allocator);
+        if let Some(mut sdf) = self.sdf_manager.take() {
+            sdf.destroy(ctx.device.as_ref(), ctx.allocator);
+        }
     }
 }
 

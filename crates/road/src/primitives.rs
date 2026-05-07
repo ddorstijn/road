@@ -92,7 +92,9 @@ impl Segment {
 
 fn closest_point_line(point: Vec2, length: f32) -> ClosestPointResult {
     let s = point.x.clamp(0.0, length);
-    let signed_distance = point.y; // positive = left of line
+    let closest = Vec2::new(s, 0.0);
+    let dist = (point - closest).length();
+    let signed_distance = dist.copysign(point.y);
     ClosestPointResult { s, signed_distance }
 }
 
@@ -117,8 +119,16 @@ fn closest_point_arc(point: Vec2, length: f32, curvature: f32) -> ClosestPointRe
     let clamped_angle = angle.clamp(0.0, max_angle);
     let s = clamped_angle / curvature.abs();
 
-    let dist_from_center = to_point.length();
-    let signed_distance = (dist_from_center - r.abs()) * curvature.signum();
+    // Evaluate arc at clamped s for the actual closest point
+    let seg = Segment::Arc { length, curvature };
+    let closest = seg.evaluate(s);
+    let diff = point - closest.position;
+    let dist = diff.length();
+
+    // Sign via cross product of tangent and diff
+    let tangent = Vec2::new(closest.heading.cos(), closest.heading.sin());
+    let cross = tangent.x * diff.y - tangent.y * diff.x;
+    let signed_distance = if cross >= 0.0 { dist } else { -dist };
 
     ClosestPointResult { s, signed_distance }
 }
@@ -214,15 +224,11 @@ fn closest_point_spiral(point: Vec2, length: f32, k_start: f32, k_end: f32) -> C
     }
 
     let pose = eval_spiral(s, k_start, k_end, length);
-    let diff = pose.position - point;
-    let normal = Vec2::new(-pose.heading.sin(), pose.heading.cos());
-    let signed_distance = diff.dot(normal);
-
-    // Convention: negative signed_distance = right, positive = left
-    // Actually we want: positive = point is to the left of the curve direction
-    // diff = P(s) - point, so point - P(s) = -diff
-    // signed_dist = (-diff).dot(normal) = -diff.dot(normal)
-    let signed_distance = -signed_distance;
+    let diff = point - pose.position;
+    let dist = diff.length();
+    let tangent = Vec2::new(pose.heading.cos(), pose.heading.sin());
+    let cross = tangent.x * diff.y - tangent.y * diff.x;
+    let signed_distance = if cross >= 0.0 { dist } else { -dist };
 
     ClosestPointResult { s, signed_distance }
 }

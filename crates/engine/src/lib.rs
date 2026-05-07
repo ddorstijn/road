@@ -2,6 +2,7 @@ pub mod camera;
 pub mod core;
 pub mod gpu_resources;
 pub mod pipeline;
+pub mod sdf;
 
 use std::sync::Arc;
 use std::time::Instant;

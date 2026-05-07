@@ -32,7 +32,8 @@ impl GpuImage {
         let usage = vk::ImageUsageFlags::STORAGE
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST
-            | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+            | vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::SAMPLED;
 
         let create_info = vk::ImageCreateInfo::builder()
             .image_type(vk::ImageType::_2D)
