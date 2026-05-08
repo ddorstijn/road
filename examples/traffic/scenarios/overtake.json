@@ -1,0 +1,40 @@
+{
+    "roads": [
+        {
+            "control_points": [
+                {
+                    "position": [
+                        0.0,
+                        0.0
+                    ],
+                    "turn_radius": 0.0,
+                    "spiral_length": 0.0
+                },
+                {
+                    "position": [
+                        500.0,
+                        0.0
+                    ],
+                    "turn_radius": 0.0,
+                    "spiral_length": 0.0
+                }
+            ]
+        }
+    ],
+    "cars": [
+        {
+            "road_id": 0,
+            "lane": 0,
+            "s": 200.0,
+            "speed": 20.0,
+            "desired_speed": 20.0
+        },
+        {
+            "road_id": 0,
+            "lane": 0,
+            "s": 50.0,
+            "speed": 35.0,
+            "desired_speed": 35.0
+        }
+    ]
+}

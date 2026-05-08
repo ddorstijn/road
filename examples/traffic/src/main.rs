@@ -1,5 +1,8 @@
 mod gpu_road_data;
+mod scenario;
 mod traffic_sim;
+
+use std::path::PathBuf;
 
 use engine::gpu_resources::GpuBuffer;
 use engine::gpu_timestamps::GpuTimestamps;
@@ -18,7 +21,7 @@ use road::network::Road;
 use road::network::RoadNetwork;
 
 use crate::gpu_road_data::{GpuRoadData, segment_type_info};
-use crate::traffic_sim::{TrafficSim, SIM_DT};
+use crate::traffic_sim::{SIM_DT, TrafficSim};
 
 // ---------------------------------------------------------------------------
 // Shader sources (rendering only — traffic shaders are in traffic_sim.rs)
@@ -116,6 +119,9 @@ struct TrafficApp {
     // Traffic simulation
     traffic: TrafficSim,
 
+    // Scenario-based car placement (overrides random init when Some)
+    scenario_cars: Option<Vec<scenario::ScenarioCar>>,
+
     // Simulation speed multiplier (0 = paused, 0.5, 1.0, 2.0, 4.0)
     sim_speed: f32,
 
@@ -164,6 +170,8 @@ impl Default for TrafficApp {
             road_render_descriptors_valid: false,
 
             traffic: TrafficSim::default(),
+
+            scenario_cars: None,
 
             sim_speed: 1.0,
             fps_accumulator: 0.0,
@@ -447,15 +455,24 @@ impl TrafficApp {
     fn update_road_render_descriptors(&mut self, ctx: &EngineContext) {
         let road_buf = match &self.gpu_road_data.road_buffer {
             Some(b) => b,
-            None => { self.road_render_descriptors_valid = false; return; }
+            None => {
+                self.road_render_descriptors_valid = false;
+                return;
+            }
         };
         let ls_buf = match &self.gpu_road_data.lane_section_buffer {
             Some(b) => b,
-            None => { self.road_render_descriptors_valid = false; return; }
+            None => {
+                self.road_render_descriptors_valid = false;
+                return;
+            }
         };
         let lane_buf = match &self.gpu_road_data.lane_buffer {
             Some(b) => b,
-            None => { self.road_render_descriptors_valid = false; return; }
+            None => {
+                self.road_render_descriptors_valid = false;
+                return;
+            }
         };
 
         write_storage_buffers(
@@ -518,37 +535,43 @@ impl TrafficApp {
         Ok(())
     }
 
-    fn handle_dirty_roads(
-        &mut self,
-        ctx: &EngineContext,
-    ) -> anyhow::Result<()> {
+    fn handle_dirty_roads(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
         if !self.dirty {
             return Ok(());
         }
 
-        unsafe { ctx.device.device_wait_idle().unwrap(); }
+        unsafe {
+            ctx.device.device_wait_idle().unwrap();
+        }
 
         self.gpu_road_data.upload(ctx.allocator, &self.network)?;
         self.rebuild_sdf_tiles(ctx)?;
         self.update_road_render_descriptors(ctx);
 
-        // Density-aware car count: ~1 car per 60m per lane
-        let cars_per_road = {
-            let mut total = 0u32;
-            for road_data in &self.network.roads {
-                let road_len = road_data.reference_line.total_length;
-                let lane_count = if road_data.lane_sections.is_empty() {
-                    1u32
-                } else {
-                    let sec = &road_data.lane_sections[0];
-                    (sec.right_lanes.len() + sec.left_lanes.len()) as u32
-                };
-                let cars_this_road = ((road_len / 60.0) as u32) * lane_count;
-                total += cars_this_road.max(1);
-            }
-            total / self.network.roads.len().max(1) as u32
-        };
-        self.traffic.initialize_cars(ctx.allocator, &self.network, cars_per_road)?;
+        if let Some(cars) = &self.scenario_cars {
+            // Scenario mode: use explicit car placements
+            self.traffic
+                .initialize_cars_from_scenario(ctx.allocator, &self.network, cars)?;
+        } else {
+            // Interactive mode: density-aware random car placement
+            let cars_per_road = {
+                let mut total = 0u32;
+                for road_data in &self.network.roads {
+                    let road_len = road_data.reference_line.total_length;
+                    let lane_count = if road_data.lane_sections.is_empty() {
+                        1u32
+                    } else {
+                        let sec = &road_data.lane_sections[0];
+                        (sec.right_lanes.len() + sec.left_lanes.len()) as u32
+                    };
+                    let cars_this_road = ((road_len / 60.0) as u32) * lane_count;
+                    total += cars_this_road.max(1);
+                }
+                total / self.network.roads.len().max(1) as u32
+            };
+            self.traffic
+                .initialize_cars(ctx.allocator, &self.network, cars_per_road)?;
+        }
         self.traffic.update_descriptors(
             ctx.device.as_ref(),
             self.gpu_road_data.segment_buffer.as_ref(),
@@ -777,7 +800,9 @@ impl TrafficApp {
         }
 
         transition_image(
-            device, cmd, sdf.atlas.image,
+            device,
+            cmd,
+            sdf.atlas.image,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::GENERAL,
         );
@@ -790,13 +815,14 @@ impl TrafficApp {
                 .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_READ);
-            let dep = vk::DependencyInfo::builder()
-                .memory_barriers(std::slice::from_ref(&barrier));
+            let dep = vk::DependencyInfo::builder().memory_barriers(std::slice::from_ref(&barrier));
             device.cmd_pipeline_barrier2(cmd, &dep);
         }
 
         transition_image(
-            device, cmd, sdf.atlas.image,
+            device,
+            cmd,
+            sdf.atlas.image,
             vk::ImageLayout::GENERAL,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         );
@@ -807,16 +833,25 @@ impl TrafficApp {
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.grid_pipeline);
             device.cmd_bind_descriptor_sets(
-                cmd, vk::PipelineBindPoint::COMPUTE, self.grid_pipeline_layout,
-                0, &[self.grid_descriptor_set], &[],
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.grid_pipeline_layout,
+                0,
+                &[self.grid_descriptor_set],
+                &[],
             );
 
             let aspect = ctx.window_width as f32 / ctx.window_height as f32;
             let inv_vp = ctx.camera.inverse_view_projection(aspect);
-            let params = CameraParams { inv_vp: inv_vp.to_cols_array_2d() };
+            let params = CameraParams {
+                inv_vp: inv_vp.to_cols_array_2d(),
+            };
             device.cmd_push_constants(
-                cmd, self.grid_pipeline_layout, vk::ShaderStageFlags::COMPUTE,
-                0, bytemuck::bytes_of(&params),
+                cmd,
+                self.grid_pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&params),
             );
 
             let wg_x = ctx.window_width.div_ceil(16);
@@ -859,8 +894,8 @@ impl TrafficApp {
                     .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
                     .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_READ);
-                let dep = vk::DependencyInfo::builder()
-                    .memory_barriers(std::slice::from_ref(&barrier));
+                let dep =
+                    vk::DependencyInfo::builder().memory_barriers(std::slice::from_ref(&barrier));
                 device.cmd_pipeline_barrier2(cmd, &dep);
             }
         }
@@ -870,7 +905,9 @@ impl TrafficApp {
         let device = ctx.device.as_ref();
 
         transition_image(
-            device, cmd, ctx.draw_image.image,
+            device,
+            cmd,
+            ctx.draw_image.image,
             vk::ImageLayout::GENERAL,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         );
@@ -897,10 +934,12 @@ impl TrafficApp {
             device.cmd_begin_rendering(cmd, &rendering_info);
 
             let viewport = vk::Viewport::builder()
-                .x(0.0).y(0.0)
+                .x(0.0)
+                .y(0.0)
                 .width(ctx.window_width as f32)
                 .height(ctx.window_height as f32)
-                .min_depth(0.0).max_depth(1.0);
+                .min_depth(0.0)
+                .max_depth(1.0);
             device.cmd_set_viewport(cmd, 0, &[*viewport]);
 
             let scissor = vk::Rect2D::builder().extent(
@@ -922,18 +961,15 @@ impl TrafficApp {
         }
 
         transition_image(
-            device, cmd, ctx.draw_image.image,
+            device,
+            cmd,
+            ctx.draw_image.image,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::ImageLayout::GENERAL,
         );
     }
 
-    fn draw_road_tiles(
-        &self,
-        device: &engine::VkDevice,
-        cmd: vk::CommandBuffer,
-        vp: &glam::Mat4,
-    ) {
+    fn draw_road_tiles(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer, vp: &glam::Mat4) {
         let sdf = match &self.sdf_manager {
             Some(s) => s,
             None => return,
@@ -944,11 +980,17 @@ impl TrafficApp {
 
         unsafe {
             device.cmd_bind_pipeline(
-                cmd, vk::PipelineBindPoint::GRAPHICS, self.road_render_pipeline,
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.road_render_pipeline,
             );
             device.cmd_bind_descriptor_sets(
-                cmd, vk::PipelineBindPoint::GRAPHICS, self.road_render_pipeline_layout,
-                0, &[self.road_render_descriptor_set], &[],
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.road_render_pipeline_layout,
+                0,
+                &[self.road_render_descriptor_set],
+                &[],
             );
         }
 
@@ -975,21 +1017,18 @@ impl TrafficApp {
 
             unsafe {
                 device.cmd_push_constants(
-                    cmd, self.road_render_pipeline_layout,
+                    cmd,
+                    self.road_render_pipeline_layout,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0, bytemuck::bytes_of(&pc),
+                    0,
+                    bytemuck::bytes_of(&pc),
                 );
                 device.cmd_draw(cmd, 6, 1, 0, 0);
             }
         }
     }
 
-    fn draw_polylines(
-        &self,
-        device: &engine::VkDevice,
-        cmd: vk::CommandBuffer,
-        vp: &glam::Mat4,
-    ) {
+    fn draw_polylines(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer, vp: &glam::Mat4) {
         let vb = match &self.polyline_buffer {
             Some(b) => b,
             None => return,
@@ -998,10 +1037,15 @@ impl TrafficApp {
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.line_pipeline);
 
-            let pc = LinePushConstants { view_proj: vp.to_cols_array_2d() };
+            let pc = LinePushConstants {
+                view_proj: vp.to_cols_array_2d(),
+            };
             device.cmd_push_constants(
-                cmd, self.line_pipeline_layout, vk::ShaderStageFlags::VERTEX,
-                0, bytemuck::bytes_of(&pc),
+                cmd,
+                self.line_pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                bytemuck::bytes_of(&pc),
             );
 
             device.cmd_bind_vertex_buffers(cmd, 0, &[vb.buffer], &[0]);
@@ -1042,8 +1086,7 @@ impl TrafficApp {
             let gpu_info = if let Some(ts) = &self.gpu_timestamps {
                 format!(
                     " | GPU: {:.1}ms (sdf:{:.1} grid:{:.1} sim:{:.1} draw:{:.1})",
-                    ts.total_ms,
-                    ts.phase_ms[0], ts.phase_ms[1], ts.phase_ms[2], ts.phase_ms[3],
+                    ts.total_ms, ts.phase_ms[0], ts.phase_ms[1], ts.phase_ms[2], ts.phase_ms[3],
                 )
             } else {
                 String::new()
@@ -1061,10 +1104,22 @@ impl TrafficApp {
 // ---------------------------------------------------------------------------
 
 fn push_cross(vertices: &mut Vec<LineVertex>, pos: Vec2, size: f32, color: [f32; 4]) {
-    vertices.push(LineVertex { position: [pos.x - size, pos.y], color });
-    vertices.push(LineVertex { position: [pos.x + size, pos.y], color });
-    vertices.push(LineVertex { position: [pos.x, pos.y - size], color });
-    vertices.push(LineVertex { position: [pos.x, pos.y + size], color });
+    vertices.push(LineVertex {
+        position: [pos.x - size, pos.y],
+        color,
+    });
+    vertices.push(LineVertex {
+        position: [pos.x + size, pos.y],
+        color,
+    });
+    vertices.push(LineVertex {
+        position: [pos.x, pos.y - size],
+        color,
+    });
+    vertices.push(LineVertex {
+        position: [pos.x, pos.y + size],
+        color,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,6 +1136,12 @@ impl App for TrafficApp {
             ctx.device.as_ref(),
             ctx.timestamp_period,
         )?);
+
+        // If a scenario was loaded before init, mark dirty to trigger road upload + car init
+        if !self.network.roads.is_empty() {
+            self.dirty = true;
+        }
+
         Ok(())
     }
 
@@ -1138,15 +1199,22 @@ impl App for TrafficApp {
     fn shutdown(&mut self, ctx: &EngineContext) {
         unsafe {
             ctx.device.destroy_pipeline(self.grid_pipeline, None);
-            ctx.device.destroy_pipeline_layout(self.grid_pipeline_layout, None);
-            ctx.device.destroy_descriptor_pool(self.grid_descriptor_pool, None);
-            ctx.device.destroy_descriptor_set_layout(self.grid_descriptor_set_layout, None);
+            ctx.device
+                .destroy_pipeline_layout(self.grid_pipeline_layout, None);
+            ctx.device
+                .destroy_descriptor_pool(self.grid_descriptor_pool, None);
+            ctx.device
+                .destroy_descriptor_set_layout(self.grid_descriptor_set_layout, None);
             ctx.device.destroy_pipeline(self.line_pipeline, None);
-            ctx.device.destroy_pipeline_layout(self.line_pipeline_layout, None);
+            ctx.device
+                .destroy_pipeline_layout(self.line_pipeline_layout, None);
             ctx.device.destroy_pipeline(self.road_render_pipeline, None);
-            ctx.device.destroy_pipeline_layout(self.road_render_pipeline_layout, None);
-            ctx.device.destroy_descriptor_pool(self.road_render_descriptor_pool, None);
-            ctx.device.destroy_descriptor_set_layout(self.road_render_descriptor_set_layout, None);
+            ctx.device
+                .destroy_pipeline_layout(self.road_render_pipeline_layout, None);
+            ctx.device
+                .destroy_descriptor_pool(self.road_render_descriptor_pool, None);
+            ctx.device
+                .destroy_descriptor_set_layout(self.road_render_descriptor_set_layout, None);
             ctx.device.destroy_sampler(self.road_render_sampler, None);
         }
         if let Some(b) = self.polyline_buffer.take() {
@@ -1167,5 +1235,27 @@ impl App for TrafficApp {
 }
 
 fn main() -> anyhow::Result<()> {
-    engine::run(TrafficApp::default())
+    let mut app = TrafficApp::default();
+
+    // Parse --scenario <path> argument
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--scenario") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--scenario requires a file path"))?;
+        let path = PathBuf::from(path);
+        let scenario = scenario::Scenario::load(&path)?;
+        let network = scenario.build_network()?;
+        scenario.validate(&network)?;
+        log::info!(
+            "Loaded scenario: {} roads, {} cars",
+            network.roads.len(),
+            scenario.cars.len()
+        );
+        app.network = network;
+        app.scenario_cars = Some(scenario.cars);
+        app.dirty = true;
+    }
+
+    engine::run(app)
 }

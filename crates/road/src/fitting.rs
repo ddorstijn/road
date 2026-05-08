@@ -3,7 +3,7 @@ use glam::Vec2;
 use crate::primitives::{ClosestPointResult, PoseOnSegment, Segment};
 
 /// A control point used to define a road path.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct ControlPoint {
     pub position: Vec2,
     /// Radius of the circular arc at this point (0 = sharp corner).

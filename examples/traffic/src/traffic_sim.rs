@@ -396,6 +396,86 @@ impl TrafficSim {
         Ok(())
     }
 
+    /// Allocate car SoA buffers and initialize with explicit car placements from a scenario.
+    pub fn initialize_cars_from_scenario(
+        &mut self,
+        allocator: &engine::vma::Allocator,
+        network: &RoadNetwork,
+        cars: &[crate::scenario::ScenarioCar],
+    ) -> anyhow::Result<()> {
+        self.destroy_buffers(allocator);
+
+        if cars.is_empty() || network.roads.is_empty() {
+            self.car_count = 0;
+            self.initialized = false;
+            return Ok(());
+        }
+
+        let total_cars = (cars.len() as u32).min(MAX_CARS);
+        self.car_count = total_cars;
+
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let n = total_cars as usize;
+
+        let (road_id_buf, road_id_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
+        let (s_buf, s_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
+        let (lane_buf, lane_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
+        let (speed_buf, speed_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
+        let (desired_buf, desired_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
+
+        let road_ids = unsafe { std::slice::from_raw_parts_mut(road_id_ptr as *mut u32, n) };
+        let s_vals = unsafe { std::slice::from_raw_parts_mut(s_ptr as *mut f32, n) };
+        let lane_vals = unsafe { std::slice::from_raw_parts_mut(lane_ptr as *mut i32, n) };
+        let speed_vals = unsafe { std::slice::from_raw_parts_mut(speed_ptr as *mut f32, n) };
+        let desired_vals = unsafe { std::slice::from_raw_parts_mut(desired_ptr as *mut f32, n) };
+
+        for (i, car) in cars.iter().take(n).enumerate() {
+            road_ids[i] = car.road_id as u32;
+            s_vals[i] = car.s;
+            lane_vals[i] = car.lane;
+            speed_vals[i] = car.speed;
+            desired_vals[i] = car.desired_speed;
+        }
+
+        // Road lengths buffer
+        let road_count = network.roads.len();
+        let (lengths_buf, lengths_ptr) =
+            GpuBuffer::new_mapped(allocator, (road_count * 4) as u64, usage)?;
+        let lengths =
+            unsafe { std::slice::from_raw_parts_mut(lengths_ptr as *mut f32, road_count) };
+        for (i, road) in network.roads.iter().enumerate() {
+            lengths[i] = road.reference_line.total_length;
+        }
+
+        self.car_road_id_buf = Some(road_id_buf);
+        self.car_s_buf = Some(s_buf);
+        self.car_lane_buf = Some(lane_buf);
+        self.car_speed_buf = Some(speed_buf);
+        self.car_desired_speed_buf = Some(desired_buf);
+        self.road_lengths_buf = Some(lengths_buf);
+
+        // Allocate sort buffers (always MAX_CARS to avoid reallocation)
+        let sort_buf_size = (MAX_CARS as u64) * 4;
+        let (keys_a, _) = GpuBuffer::new_mapped(allocator, sort_buf_size, usage)?;
+        let (keys_b, _) = GpuBuffer::new_mapped(allocator, sort_buf_size, usage)?;
+        let (vals_a, _) = GpuBuffer::new_mapped(allocator, sort_buf_size, usage)?;
+        let (vals_b, _) = GpuBuffer::new_mapped(allocator, sort_buf_size, usage)?;
+
+        let hist_size = 256u64 * (NUM_SORT_WG as u64) * 4;
+        let hist_usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        let (hist_buf, _) = GpuBuffer::new_mapped(allocator, hist_size, hist_usage)?;
+
+        self.sort_keys_a_buf = Some(keys_a);
+        self.sort_keys_b_buf = Some(keys_b);
+        self.sort_vals_a_buf = Some(vals_a);
+        self.sort_vals_b_buf = Some(vals_b);
+        self.sort_histogram_buf = Some(hist_buf);
+
+        self.sim_tick = 0;
+        self.initialized = true;
+        Ok(())
+    }
+
     /// Update descriptor sets to point at current buffers.
     pub fn update_descriptors(
         &mut self,
