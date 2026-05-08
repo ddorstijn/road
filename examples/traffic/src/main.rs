@@ -34,6 +34,122 @@ const TRAFFIC_LANE_CHANGE_WGSL: &str =
     include_str!("../../../assets/shaders/traffic_lane_change.wgsl");
 
 // ---------------------------------------------------------------------------
+// GPU Timestamp profiler
+// ---------------------------------------------------------------------------
+
+/// Timestamp query indices
+const TS_FRAME_BEGIN: u32 = 0;
+const TS_SDF_END: u32 = 1;
+const TS_GRID_END: u32 = 2;
+const TS_TRAFFIC_END: u32 = 3;
+const TS_RENDER_END: u32 = 4;
+const TS_COUNT: u32 = 5;
+
+struct GpuTimestamps {
+    query_pool: vk::QueryPool,
+    timestamp_period_ns: f32,
+    // Accumulated results (ms) — smoothed over multiple frames
+    sdf_ms: f32,
+    grid_ms: f32,
+    traffic_ms: f32,
+    render_ms: f32,
+    total_ms: f32,
+}
+
+impl GpuTimestamps {
+    fn new(device: &engine::VkDevice, timestamp_period: f32) -> anyhow::Result<Self> {
+        let pool_info = vk::QueryPoolCreateInfo::builder()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(TS_COUNT);
+        let query_pool = unsafe { device.create_query_pool(&pool_info, None)? };
+        Ok(Self {
+            query_pool,
+            timestamp_period_ns: timestamp_period,
+            sdf_ms: 0.0,
+            grid_ms: 0.0,
+            traffic_ms: 0.0,
+            render_ms: 0.0,
+            total_ms: 0.0,
+        })
+    }
+
+    fn read_results(&mut self, device: &engine::VkDevice) {
+        let mut timestamps = [0u64; TS_COUNT as usize];
+        let result = unsafe {
+            let data = std::slice::from_raw_parts_mut(
+                timestamps.as_mut_ptr() as *mut u8,
+                std::mem::size_of_val(&timestamps),
+            );
+            device.get_query_pool_results(
+                self.query_pool,
+                0,
+                TS_COUNT,
+                data,
+                std::mem::size_of::<u64>() as u64,
+                vk::QueryResultFlags::_64,
+            )
+        };
+        if result.is_ok() {
+            let to_ms = |t: u64| -> f32 { t as f32 * self.timestamp_period_ns / 1_000_000.0 };
+            let sdf = to_ms(
+                timestamps[TS_SDF_END as usize].wrapping_sub(timestamps[TS_FRAME_BEGIN as usize]),
+            );
+            let grid = to_ms(
+                timestamps[TS_GRID_END as usize].wrapping_sub(timestamps[TS_SDF_END as usize]),
+            );
+            let traffic = to_ms(
+                timestamps[TS_TRAFFIC_END as usize].wrapping_sub(timestamps[TS_GRID_END as usize]),
+            );
+            let render = to_ms(
+                timestamps[TS_RENDER_END as usize]
+                    .wrapping_sub(timestamps[TS_TRAFFIC_END as usize]),
+            );
+            let total = to_ms(
+                timestamps[TS_RENDER_END as usize]
+                    .wrapping_sub(timestamps[TS_FRAME_BEGIN as usize]),
+            );
+
+            // Exponential moving average (α = 0.1)
+            let a = 0.1f32;
+            self.sdf_ms = self.sdf_ms * (1.0 - a) + sdf * a;
+            self.grid_ms = self.grid_ms * (1.0 - a) + grid * a;
+            self.traffic_ms = self.traffic_ms * (1.0 - a) + traffic * a;
+            self.render_ms = self.render_ms * (1.0 - a) + render * a;
+            self.total_ms = self.total_ms * (1.0 - a) + total * a;
+        }
+    }
+
+    fn reset_and_begin(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
+        unsafe {
+            device.cmd_reset_query_pool(cmd, self.query_pool, 0, TS_COUNT);
+            device.cmd_write_timestamp2(
+                cmd,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                self.query_pool,
+                TS_FRAME_BEGIN,
+            );
+        }
+    }
+
+    fn write(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer, index: u32) {
+        unsafe {
+            device.cmd_write_timestamp2(
+                cmd,
+                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                self.query_pool,
+                index,
+            );
+        }
+    }
+
+    fn destroy(&self, device: &engine::VkDevice) {
+        unsafe {
+            device.destroy_query_pool(self.query_pool, None);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GPU data structs (SSBOs for later phases)
 // ---------------------------------------------------------------------------
 
@@ -1502,6 +1618,17 @@ struct TrafficApp {
 
     // Traffic simulation
     traffic: TrafficSim,
+
+    // Simulation speed multiplier (0 = paused, 0.5, 1.0, 2.0, 4.0)
+    sim_speed: f32,
+
+    // FPS tracking
+    fps_accumulator: f32,
+    fps_frame_count: u32,
+    fps_display: f32,
+
+    // GPU timestamp profiling
+    gpu_timestamps: Option<GpuTimestamps>,
 }
 
 impl Default for TrafficApp {
@@ -1540,6 +1667,12 @@ impl Default for TrafficApp {
             road_render_descriptors_valid: false,
 
             traffic: TrafficSim::default(),
+
+            sim_speed: 1.0,
+            fps_accumulator: 0.0,
+            fps_frame_count: 0,
+            fps_display: 0.0,
+            gpu_timestamps: None,
         }
     }
 }
@@ -2119,6 +2252,21 @@ impl TrafficApp {
             needs_rebuild = true;
         }
 
+        // Simulation speed controls
+        use engine::winit::keyboard::{Key, NamedKey};
+        for key in &ctx.input.keys_pressed {
+            match key {
+                Key::Character(c) if c.as_str() == "1" => self.sim_speed = 0.5,
+                Key::Character(c) if c.as_str() == "2" => self.sim_speed = 1.0,
+                Key::Character(c) if c.as_str() == "3" => self.sim_speed = 2.0,
+                Key::Character(c) if c.as_str() == "4" => self.sim_speed = 4.0,
+                Key::Named(NamedKey::Space) => {
+                    self.sim_speed = if self.sim_speed == 0.0 { 1.0 } else { 0.0 };
+                }
+                _ => {}
+            }
+        }
+
         needs_rebuild
     }
 }
@@ -2148,6 +2296,10 @@ impl App for TrafficApp {
         self.create_line_pipeline(ctx)?;
         self.create_sdf_system(ctx)?;
         self.traffic.create_pipelines(ctx)?;
+        self.gpu_timestamps = Some(GpuTimestamps::new(
+            ctx.device.as_ref(),
+            ctx.timestamp_period,
+        )?);
         Ok(())
     }
 
@@ -2158,6 +2310,12 @@ impl App for TrafficApp {
 
     fn render(&mut self, ctx: &EngineContext, cmd: vk::CommandBuffer) -> anyhow::Result<()> {
         let device = ctx.device.as_ref();
+
+        // Read GPU timestamps from previous frame, then reset for this frame
+        if let Some(ts) = &mut self.gpu_timestamps {
+            ts.read_results(device);
+            ts.reset_and_begin(device, cmd);
+        }
 
         // Process input
         let needs_rebuild = self.process_input(ctx);
@@ -2245,6 +2403,11 @@ impl App for TrafficApp {
             }
         }
 
+        // Timestamp: SDF done
+        if let Some(ts) = &self.gpu_timestamps {
+            ts.write(device, cmd, TS_SDF_END);
+        }
+
         // --- Compute: grid background ---
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.grid_pipeline);
@@ -2275,12 +2438,17 @@ impl App for TrafficApp {
             device.cmd_dispatch(cmd, wg_x, wg_y, 1);
         }
 
+        // Timestamp: grid done
+        if let Some(ts) = &self.gpu_timestamps {
+            ts.write(device, cmd, TS_GRID_END);
+        }
+
         // --- Compute: traffic simulation update (fixed timestep) ---
         // Phase 8: Sort → IDM → MOBIL (replaces simple s += v*dt)
         if self.traffic.initialized && self.traffic.car_count > 0 {
-            self.traffic.sim_accumulator += ctx.dt;
-            // Cap to max 2 ticks per frame to avoid overloading the command buffer
-            let max_ticks = 2;
+            self.traffic.sim_accumulator += ctx.dt * self.sim_speed;
+            // Cap to max ticks per frame (higher for faster sim speeds)
+            let max_ticks = (2.0 * self.sim_speed).ceil().max(2.0) as u32;
             let mut ticks_this_frame = 0u32;
             while self.traffic.sim_accumulator >= SIM_DT && ticks_this_frame < max_ticks {
                 self.traffic.sim_accumulator -= SIM_DT;
@@ -2551,6 +2719,11 @@ impl App for TrafficApp {
             }
         }
 
+        // Timestamp: traffic sim done
+        if let Some(ts) = &self.gpu_timestamps {
+            ts.write(device, cmd, TS_TRAFFIC_END);
+        }
+
         // --- Graphics: SDF debug visualization + road polylines ---
         {
             transition_image(
@@ -2727,6 +2900,39 @@ impl App for TrafficApp {
             );
         }
 
+        // Timestamp: render done
+        if let Some(ts) = &self.gpu_timestamps {
+            ts.write(device, cmd, TS_RENDER_END);
+        }
+
+        // --- Window title HUD ---
+        self.fps_accumulator += ctx.dt;
+        self.fps_frame_count += 1;
+        if self.fps_accumulator >= 0.5 {
+            self.fps_display = self.fps_frame_count as f32 / self.fps_accumulator;
+            self.fps_accumulator = 0.0;
+            self.fps_frame_count = 0;
+        }
+        if let Some(window) = ctx.window {
+            let speed_label = if self.sim_speed == 0.0 {
+                "PAUSED".to_string()
+            } else {
+                format!("{:.1}x", self.sim_speed)
+            };
+            let gpu_info = if let Some(ts) = &self.gpu_timestamps {
+                format!(
+                    " | GPU: {:.1}ms (sdf:{:.1} grid:{:.1} sim:{:.1} draw:{:.1})",
+                    ts.total_ms, ts.sdf_ms, ts.grid_ms, ts.traffic_ms, ts.render_ms,
+                )
+            } else {
+                String::new()
+            };
+            window.set_title(&format!(
+                "Traffic Sim | {:.0} FPS | {} cars | {}{} | [Space]=pause [1-4]=speed",
+                self.fps_display, self.traffic.car_count, speed_label, gpu_info,
+            ));
+        }
+
         Ok(())
     }
 
@@ -2762,6 +2968,9 @@ impl App for TrafficApp {
             sdf.destroy(ctx.device.as_ref(), ctx.allocator);
         }
         self.traffic.destroy(ctx.device.as_ref(), ctx.allocator);
+        if let Some(ts) = self.gpu_timestamps.take() {
+            ts.destroy(ctx.device.as_ref());
+        }
     }
 }
 

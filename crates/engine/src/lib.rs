@@ -5,6 +5,7 @@ pub mod gpu_resources;
 pub mod pipeline;
 pub mod sdf;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,6 +29,7 @@ use crate::gpu_resources::GpuImage;
 pub use vulkanalia::{vk, vk::DeviceV1_0, vk::DeviceV1_3, vk::Handle, vk::HasBuilder};
 pub use vulkanalia_bootstrap::Device as VkDevice;
 pub use vulkanalia_vma as vma;
+pub use winit;
 
 pub use crate::core::transition_image;
 
@@ -46,6 +48,9 @@ pub struct EngineContext<'a> {
     pub dt: f32,
     pub window_width: u32,
     pub window_height: u32,
+    pub frame_number: u64,
+    pub window: Option<&'a Window>,
+    pub timestamp_period: f32,
 }
 
 pub trait App {
@@ -83,6 +88,8 @@ pub struct InputState {
     pub right_mouse_pressed: bool,
     /// True for one frame when Escape was just pressed.
     pub escape_pressed: bool,
+    /// Keys pressed this frame (one-shot, cleared each frame).
+    pub keys_pressed: HashSet<winit::keyboard::Key>,
 }
 
 impl InputState {
@@ -93,6 +100,7 @@ impl InputState {
         self.left_mouse_pressed = false;
         self.right_mouse_pressed = false;
         self.escape_pressed = false;
+        self.keys_pressed.clear();
     }
 }
 
@@ -148,6 +156,9 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
             dt: 0.0,
             window_width: core.window_extent().width,
             window_height: core.window_extent().height,
+            frame_number: 0,
+            window: self.window.as_deref(),
+            timestamp_period: core.timestamp_period(),
         };
         self.app.init(&ctx).expect("App::init failed");
     }
@@ -173,6 +184,9 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                         dt: self.dt,
                         window_width: core.window_extent().width,
                         window_height: core.window_extent().height,
+                        frame_number: 0,
+                        window: None,
+                        timestamp_period: core.timestamp_period(),
                     };
                     self.app.shutdown(&ctx);
                 }
@@ -192,6 +206,9 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                         dt: self.dt,
                         window_width: core.window_extent().width,
                         window_height: core.window_extent().height,
+                        frame_number: 0,
+                        window: None,
+                        timestamp_period: core.timestamp_period(),
                     };
                     self.app.resize(&ctx).expect("App::resize failed");
                 }
@@ -237,6 +254,7 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                     if event.logical_key == Key::Named(NamedKey::Escape) {
                         self.input.escape_pressed = true;
                     }
+                    self.input.keys_pressed.insert(event.logical_key.clone());
                 }
             }
 
@@ -276,9 +294,12 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                     let input = &self.input;
                     let camera = &self.camera;
                     let dt = self.dt;
+                    let frame_number = core.frame_number() as u64;
                     let device_ref = core.device().clone();
                     let allocator_ref: *const vma::Allocator = core.allocator();
                     let draw_image_ref: *const GpuImage = core.draw_image();
+                    let window_ref: Option<&Window> = self.window.as_deref();
+                    let timestamp_period = core.timestamp_period();
 
                     core.draw_frame(|_device, cmd, _draw_image| {
                         let ctx = EngineContext {
@@ -290,6 +311,9 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                             dt,
                             window_width: window_extent.width,
                             window_height: window_extent.height,
+                            frame_number,
+                            window: window_ref,
+                            timestamp_period,
                         };
                         self.app.render(&ctx, cmd).expect("App::render failed");
                     })

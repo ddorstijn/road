@@ -48,6 +48,7 @@ pub struct Core {
 
     pub(crate) frames: Vec<FrameData>,
     pub(crate) frame_number: usize,
+    pub(crate) timestamp_period: f32,
 }
 
 const FRAME_OVERLAP: usize = 2;
@@ -105,6 +106,13 @@ impl Core {
             vk::Format::R16G16B16A16_SFLOAT,
         )?;
 
+        // --- Timestamp period (ns per tick) ---
+        let timestamp_period = unsafe {
+            let inst: &vulkanalia::Instance = instance.as_ref().as_ref();
+            let props = inst.get_physical_device_properties(*device.physical_device().as_ref());
+            props.limits.timestamp_period
+        };
+
         // --- Frame data ---
         let frames = Self::create_frame_data(&device, graphics_queue_family, FRAME_OVERLAP)?;
 
@@ -119,6 +127,7 @@ impl Core {
             draw_image,
             frames,
             frame_number: 0,
+            timestamp_period,
         })
     }
 
@@ -290,6 +299,14 @@ impl Core {
 
     pub fn draw_image(&self) -> &GpuImage {
         &self.draw_image
+    }
+
+    pub fn frame_number(&self) -> usize {
+        self.frame_number
+    }
+
+    pub fn timestamp_period(&self) -> f32 {
+        self.timestamp_period
     }
 
     pub fn window_extent(&self) -> vk::Extent2D {
