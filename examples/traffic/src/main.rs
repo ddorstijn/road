@@ -92,27 +92,37 @@ impl GpuTimestamps {
                 TS_COUNT,
                 data,
                 std::mem::size_of::<u64>() as u64,
-                vk::QueryResultFlags::_64,
+                vk::QueryResultFlags::_64 | vk::QueryResultFlags::WAIT,
             )
         };
         if result.is_ok() {
-            let to_ms = |t: u64| -> f32 { t as f32 * self.timestamp_period_ns / 1_000_000.0 };
+            let period = self.timestamp_period_ns as f64;
+            let to_ms = |a: u64, b: u64| -> f32 {
+                if b >= a {
+                    ((b - a) as f64 * period / 1_000_000.0) as f32
+                } else {
+                    0.0
+                }
+            };
             let sdf = to_ms(
-                timestamps[TS_SDF_END as usize].wrapping_sub(timestamps[TS_FRAME_BEGIN as usize]),
+                timestamps[TS_FRAME_BEGIN as usize],
+                timestamps[TS_SDF_END as usize],
             );
             let grid = to_ms(
-                timestamps[TS_GRID_END as usize].wrapping_sub(timestamps[TS_SDF_END as usize]),
+                timestamps[TS_SDF_END as usize],
+                timestamps[TS_GRID_END as usize],
             );
             let traffic = to_ms(
-                timestamps[TS_TRAFFIC_END as usize].wrapping_sub(timestamps[TS_GRID_END as usize]),
+                timestamps[TS_GRID_END as usize],
+                timestamps[TS_TRAFFIC_END as usize],
             );
             let render = to_ms(
-                timestamps[TS_RENDER_END as usize]
-                    .wrapping_sub(timestamps[TS_TRAFFIC_END as usize]),
+                timestamps[TS_TRAFFIC_END as usize],
+                timestamps[TS_RENDER_END as usize],
             );
             let total = to_ms(
-                timestamps[TS_RENDER_END as usize]
-                    .wrapping_sub(timestamps[TS_FRAME_BEGIN as usize]),
+                timestamps[TS_FRAME_BEGIN as usize],
+                timestamps[TS_RENDER_END as usize],
             );
 
             // Exponential moving average (α = 0.1)
