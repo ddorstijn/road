@@ -9,7 +9,7 @@
 
 // --- Bindings ---
 
-@group(0) @binding(0) var sdf_atlas: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(0) var sdf_atlas: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(1) var<storage, read> segments: array<GpuSegment>;
 @group(0) @binding(2) var<storage, read> tile_headers: array<TileHeader>;
 @group(0) @binding(3) var<storage, read> tile_segment_indices: array<u32>;

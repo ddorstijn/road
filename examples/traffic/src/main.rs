@@ -54,6 +54,8 @@ struct GpuTimestamps {
     traffic_ms: f32,
     render_ms: f32,
     total_ms: f32,
+    // Skip read on first frame (queries not yet written)
+    has_results: bool,
 }
 
 impl GpuTimestamps {
@@ -70,10 +72,14 @@ impl GpuTimestamps {
             traffic_ms: 0.0,
             render_ms: 0.0,
             total_ms: 0.0,
+            has_results: false,
         })
     }
 
     fn read_results(&mut self, device: &engine::VkDevice) {
+        if !self.has_results {
+            return;
+        }
         let mut timestamps = [0u64; TS_COUNT as usize];
         let result = unsafe {
             let data = std::slice::from_raw_parts_mut(
@@ -119,7 +125,7 @@ impl GpuTimestamps {
         }
     }
 
-    fn reset_and_begin(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
+    fn reset_and_begin(&mut self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
         unsafe {
             device.cmd_reset_query_pool(cmd, self.query_pool, 0, TS_COUNT);
             device.cmd_write_timestamp2(
@@ -129,6 +135,7 @@ impl GpuTimestamps {
                 TS_FRAME_BEGIN,
             );
         }
+        self.has_results = true;
     }
 
     fn write(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer, index: u32) {
