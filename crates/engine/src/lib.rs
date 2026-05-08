@@ -1,4 +1,5 @@
 pub mod camera;
+pub mod car_renderer;
 pub mod core;
 pub mod gpu_resources;
 pub mod pipeline;

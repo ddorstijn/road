@@ -1,3 +1,4 @@
+use engine::car_renderer::{CarRenderPushConstants, CarRenderer};
 use engine::gpu_resources::GpuBuffer;
 use engine::pipeline::{
     GraphicsPipelineDesc, allocate_descriptor_set, compile_wgsl, create_compute_pipeline,
@@ -21,7 +22,7 @@ const SDF_ROAD_EVAL_WGSL: &str = include_str!("../../../assets/shaders/shared/ro
 const SDF_GENERATE_WGSL: &str = include_str!("../../../assets/shaders/sdf_generate.wgsl");
 const ROAD_RENDER_WGSL: &str = include_str!("../../../assets/shaders/road_render.wgsl");
 const TRAFFIC_UPDATE_WGSL: &str = include_str!("../../../assets/shaders/traffic_update.wgsl");
-const CAR_DEBUG_WGSL: &str = include_str!("../../../assets/shaders/car_debug.wgsl");
+const CAR_RENDER_WGSL: &str = include_str!("../../../assets/shaders/car_render.wgsl");
 const TRAFFIC_SORT_KEYS_WGSL: &str = include_str!("../../../assets/shaders/traffic_sort_keys.wgsl");
 const TRAFFIC_SORT_HISTOGRAM_WGSL: &str =
     include_str!("../../../assets/shaders/traffic_sort_histogram.wgsl");
@@ -135,16 +136,6 @@ const LANE_CHANGE_INTERVAL: u32 = 30;
 struct TrafficUpdatePushConstants {
     dt: f32,
     car_count: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct CarDebugPushConstants {
-    view_proj: [[f32; 4]; 4],
-    car_count: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 }
 
 #[repr(C)]
@@ -280,13 +271,8 @@ struct TrafficSim {
     mobil_descriptor_pool: vk::DescriptorPool,
     mobil_descriptor_set: vk::DescriptorSet,
 
-    // Graphics pipeline (car debug vis)
-    debug_pipeline: vk::Pipeline,
-    debug_pipeline_layout: vk::PipelineLayout,
-    debug_descriptor_set_layout: vk::DescriptorSetLayout,
-    debug_descriptor_pool: vk::DescriptorPool,
-    debug_descriptor_set: vk::DescriptorSet,
-    debug_descriptors_valid: bool,
+    // Car renderer (instanced rendering)
+    car_renderer: Option<CarRenderer>,
 
     // Simulation state
     car_count: u32,
@@ -353,12 +339,7 @@ impl Default for TrafficSim {
             mobil_descriptor_pool: vk::DescriptorPool::null(),
             mobil_descriptor_set: vk::DescriptorSet::null(),
 
-            debug_pipeline: vk::Pipeline::null(),
-            debug_pipeline_layout: vk::PipelineLayout::null(),
-            debug_descriptor_set_layout: vk::DescriptorSetLayout::null(),
-            debug_descriptor_pool: vk::DescriptorPool::null(),
-            debug_descriptor_set: vk::DescriptorSet::null(),
-            debug_descriptors_valid: false,
+            car_renderer: None,
 
             car_count: 0,
             sim_accumulator: 0.0,
@@ -421,67 +402,15 @@ impl TrafficSim {
             self.update_pipeline_layout = layout;
         }
 
-        // --- Graphics pipeline: car debug visualization ---
+        // --- Car renderer (instanced rendering) ---
         {
-            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..9)
-                .map(|i| {
-                    vk::DescriptorSetLayoutBinding::builder()
-                        .binding(i)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::VERTEX)
-                        .build()
-                })
-                .collect();
-
-            self.debug_descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
-
-            let pool_sizes = [vk::DescriptorPoolSize::builder()
-                .type_(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(9)
-                .build()];
-            let pool_info = vk::DescriptorPoolCreateInfo::builder()
-                .max_sets(1)
-                .pool_sizes(&pool_sizes);
-            self.debug_descriptor_pool =
-                unsafe { device.create_descriptor_pool(&pool_info, None)? };
-
-            self.debug_descriptor_set = allocate_descriptor_set(
+            let shared_wgsl = format!("{}\n{}", SDF_TYPES_WGSL, SDF_ROAD_EVAL_WGSL);
+            self.car_renderer = Some(CarRenderer::new(
                 device,
-                self.debug_descriptor_pool,
-                self.debug_descriptor_set_layout,
-            )?;
-
-            // Compile car_debug shader with shared types + road_eval prepended
-            let full_source = format!(
-                "{}\n{}\n{}",
-                SDF_TYPES_WGSL, SDF_ROAD_EVAL_WGSL, CAR_DEBUG_WGSL
-            );
-            let spirv = compile_wgsl(&full_source)?;
-
-            let push_constant_ranges = [vk::PushConstantRange::builder()
-                .stage_flags(vk::ShaderStageFlags::VERTEX)
-                .offset(0)
-                .size(std::mem::size_of::<CarDebugPushConstants>() as u32)
-                .build()];
-
-            let desc = GraphicsPipelineDesc {
-                vertex_spirv: &spirv,
-                fragment_spirv: &spirv,
-                vertex_entry: "vs_main",
-                fragment_entry: "fs_main",
-                vertex_binding_descriptions: &[],
-                vertex_attribute_descriptions: &[],
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                color_attachment_format: ctx.draw_image.format,
-                push_constant_ranges: &push_constant_ranges,
-                descriptor_set_layouts: &[self.debug_descriptor_set_layout],
-                line_width: 1.0,
-            };
-
-            let (pipeline, layout) = create_graphics_pipeline(device, &desc)?;
-            self.debug_pipeline = pipeline;
-            self.debug_pipeline_layout = layout;
+                ctx.draw_image.format,
+                &shared_wgsl,
+                CAR_RENDER_WGSL,
+            )?);
         }
 
         // --- Sort: build keys pipeline ---
@@ -911,7 +840,6 @@ impl TrafficSim {
         lane_buffer: Option<&GpuBuffer>,
     ) {
         if !self.initialized {
-            self.debug_descriptors_valid = false;
             return;
         }
 
@@ -980,79 +908,28 @@ impl TrafficSim {
             }
         }
 
-        // Update graphics descriptor set (bindings 0-4: car buffers, 5-8: road data)
-        let seg_buf = match segment_buffer {
-            Some(b) => b,
-            None => {
-                self.debug_descriptors_valid = false;
-                return;
-            }
-        };
-        let rd_buf = match road_buffer {
-            Some(b) => b,
-            None => {
-                self.debug_descriptors_valid = false;
-                return;
-            }
-        };
-        let ls_buf = match lane_section_buffer {
-            Some(b) => b,
-            None => {
-                self.debug_descriptors_valid = false;
-                return;
-            }
-        };
-        let ln_buf = match lane_buffer {
-            Some(b) => b,
-            None => {
-                self.debug_descriptors_valid = false;
-                return;
-            }
-        };
-
-        {
-            let bufs = [
-                car_road_id,
-                car_s,
-                car_lane,
-                car_speed,
-                car_desired,
-                seg_buf,
-                rd_buf,
-                ls_buf,
-                ln_buf,
-            ];
-            let buf_infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
-                .iter()
-                .map(|b| {
-                    [vk::DescriptorBufferInfo::builder()
-                        .buffer(b.buffer)
-                        .offset(0)
-                        .range(b.size)
-                        .build()]
-                })
-                .collect();
-
-            let writes: Vec<vk::WriteDescriptorSet> = buf_infos
-                .iter()
-                .enumerate()
-                .map(|(i, info)| {
-                    vk::WriteDescriptorSet::builder()
-                        .dst_set(self.debug_descriptor_set)
-                        .dst_binding(i as u32)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(info)
-                        .build()
-                })
-                .collect();
-
-            unsafe {
-                device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
+        // Update car renderer descriptors (bindings 0-4: car buffers, 5-8: road data)
+        if let (Some(seg_buf), Some(rd_buf), Some(ls_buf), Some(ln_buf)) = (
+            segment_buffer,
+            road_buffer,
+            lane_section_buffer,
+            lane_buffer,
+        ) {
+            if let Some(renderer) = &mut self.car_renderer {
+                renderer.update_descriptors(
+                    device,
+                    car_road_id,
+                    car_s,
+                    car_lane,
+                    car_speed,
+                    car_desired,
+                    seg_buf,
+                    rd_buf,
+                    ls_buf,
+                    ln_buf,
+                );
             }
         }
-
-        self.debug_descriptors_valid = true;
 
         // --- Update sort key build descriptors ---
         // Bindings: 0 car_road_id, 1 car_s, 2 car_lane, 3 road_lengths, 4 sort_keys_a, 5 sort_vals_a
@@ -1408,11 +1285,9 @@ impl TrafficSim {
             device.destroy_pipeline_layout(self.mobil_pipeline_layout, None);
             device.destroy_descriptor_pool(self.mobil_descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.mobil_descriptor_set_layout, None);
-
-            device.destroy_pipeline(self.debug_pipeline, None);
-            device.destroy_pipeline_layout(self.debug_pipeline_layout, None);
-            device.destroy_descriptor_pool(self.debug_descriptor_pool, None);
-            device.destroy_descriptor_set_layout(self.debug_descriptor_set_layout, None);
+        }
+        if let Some(renderer) = self.car_renderer.take() {
+            renderer.destroy(device);
         }
         self.destroy_buffers(allocator);
     }
@@ -2824,41 +2699,20 @@ impl App for TrafficApp {
                     }
                 }
 
-                // --- Draw car debug points ---
-                if self.traffic.initialized
-                    && self.traffic.car_count > 0
-                    && self.traffic.debug_descriptors_valid
-                {
-                    device.cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.traffic.debug_pipeline,
-                    );
-                    device.cmd_bind_descriptor_sets(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.traffic.debug_pipeline_layout,
-                        0,
-                        &[self.traffic.debug_descriptor_set],
-                        &[],
-                    );
-
-                    let pc = CarDebugPushConstants {
-                        view_proj: vp.to_cols_array_2d(),
-                        car_count: self.traffic.car_count,
-                        _pad0: 0,
-                        _pad1: 0,
-                        _pad2: 0,
-                    };
-                    device.cmd_push_constants(
-                        cmd,
-                        self.traffic.debug_pipeline_layout,
-                        vk::ShaderStageFlags::VERTEX,
-                        0,
-                        bytemuck::bytes_of(&pc),
-                    );
-
-                    device.cmd_draw(cmd, 6, self.traffic.car_count, 0, 0);
+                // --- Draw cars (instanced rendering) ---
+                if self.traffic.initialized && self.traffic.car_count > 0 {
+                    if let Some(renderer) = &self.traffic.car_renderer {
+                        if renderer.is_ready() {
+                            let pc = CarRenderPushConstants {
+                                view_proj: vp.to_cols_array_2d(),
+                                car_count: self.traffic.car_count,
+                                _pad0: 0,
+                                _pad1: 0,
+                                _pad2: 0,
+                            };
+                            renderer.draw(device, cmd, &pc);
+                        }
+                    }
                 }
 
                 device.cmd_end_rendering(cmd);
