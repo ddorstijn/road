@@ -2,6 +2,7 @@ pub mod camera;
 pub mod car_renderer;
 pub mod core;
 pub mod gpu_resources;
+pub mod gpu_timestamps;
 pub mod pipeline;
 pub mod sdf;
 
@@ -11,7 +12,7 @@ use std::time::Instant;
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 use vulkanalia_bootstrap::Device as BootstrapDevice;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -32,6 +33,7 @@ pub use vulkanalia_vma as vma;
 pub use winit;
 
 pub use crate::core::transition_image;
+pub use crate::pipeline::{write_storage_buffers, ComputePass};
 
 // ---------------------------------------------------------------------------
 // App trait — implemented by the game

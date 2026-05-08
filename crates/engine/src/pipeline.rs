@@ -1,5 +1,3 @@
-use std::ffi::CStr;
-
 use naga::back::spv;
 use naga::front::wgsl;
 use vulkanalia::bytecode::Bytecode;
@@ -49,7 +47,7 @@ pub fn create_compute_pipeline(
     let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
 
     // Pipeline
-    let entry_point = CStr::from_bytes_with_nul(b"main\0").unwrap();
+    let entry_point = c"main";
     let stage_info = vk::PipelineShaderStageCreateInfo::builder()
         .stage(vk::ShaderStageFlags::COMPUTE)
         .module(shader_module)
@@ -74,6 +72,154 @@ pub fn create_compute_pipeline(
     }
 
     Ok((pipeline, pipeline_layout))
+}
+
+// ---------------------------------------------------------------------------
+// ComputePass — bundles pipeline + layout + descriptor set(s)
+// ---------------------------------------------------------------------------
+
+/// A complete compute pipeline with its descriptor set layout, pool, and set(s).
+///
+/// Reduces the per-pipeline boilerplate from ~5 fields to 1.
+pub struct ComputePass {
+    pub pipeline: vk::Pipeline,
+    pub pipeline_layout: vk::PipelineLayout,
+    pub descriptor_set_layout: vk::DescriptorSetLayout,
+    pub descriptor_pool: vk::DescriptorPool,
+    pub descriptor_sets: Vec<vk::DescriptorSet>,
+}
+
+impl ComputePass {
+    /// Create a compute pass from WGSL source.
+    ///
+    /// `num_storage_buffers` is the number of SSBO bindings (binding 0..N-1).
+    /// `num_sets` is how many descriptor sets to allocate (typically 1 or 2 for ping-pong).
+    pub fn new(
+        device: &Device,
+        wgsl_source: &str,
+        num_storage_buffers: u32,
+        push_constant_size: u32,
+        num_sets: u32,
+    ) -> anyhow::Result<Self> {
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..num_storage_buffers)
+            .map(|i| {
+                vk::DescriptorSetLayoutBinding::builder()
+                    .binding(i)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    .build()
+            })
+            .collect();
+
+        let descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
+
+        let pool_sizes = [vk::DescriptorPoolSize::builder()
+            .type_(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(num_storage_buffers * num_sets)
+            .build()];
+        let pool_info = vk::DescriptorPoolCreateInfo::builder()
+            .max_sets(num_sets)
+            .pool_sizes(&pool_sizes);
+        let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+        let mut descriptor_sets = Vec::with_capacity(num_sets as usize);
+        for _ in 0..num_sets {
+            descriptor_sets.push(allocate_descriptor_set(
+                device,
+                descriptor_pool,
+                descriptor_set_layout,
+            )?);
+        }
+
+        let spirv = compile_wgsl(wgsl_source)?;
+
+        let push_constant_ranges = [vk::PushConstantRange::builder()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(push_constant_size)
+            .build()];
+
+        let (pipeline, pipeline_layout) = create_compute_pipeline(
+            device,
+            &spirv,
+            &[descriptor_set_layout],
+            &push_constant_ranges,
+        )?;
+
+        Ok(Self {
+            pipeline,
+            pipeline_layout,
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_sets,
+        })
+    }
+
+    /// The first (or only) descriptor set.
+    pub fn set(&self) -> vk::DescriptorSet {
+        self.descriptor_sets[0]
+    }
+
+    /// Descriptor set by index (for ping-pong patterns).
+    pub fn set_at(&self, index: usize) -> vk::DescriptorSet {
+        self.descriptor_sets[index]
+    }
+
+    /// Destroy all Vulkan resources.
+    pub fn destroy(&self, device: &Device) {
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor write helpers
+// ---------------------------------------------------------------------------
+
+use crate::gpu_resources::GpuBuffer;
+
+/// Write storage buffer descriptors starting at `start_binding`.
+///
+/// Binds `buffers[0]` to `start_binding`, `buffers[1]` to `start_binding + 1`, etc.
+pub fn write_storage_buffers(
+    device: &Device,
+    set: vk::DescriptorSet,
+    start_binding: u32,
+    buffers: &[&GpuBuffer],
+) {
+    let buf_infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
+        .iter()
+        .map(|b| {
+            [vk::DescriptorBufferInfo::builder()
+                .buffer(b.buffer)
+                .offset(0)
+                .range(b.size)
+                .build()]
+        })
+        .collect();
+
+    let writes: Vec<vk::WriteDescriptorSet> = buf_infos
+        .iter()
+        .enumerate()
+        .map(|(i, info)| {
+            vk::WriteDescriptorSet::builder()
+                .dst_set(set)
+                .dst_binding(start_binding + i as u32)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(info)
+                .build()
+        })
+        .collect();
+
+    unsafe {
+        device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
+    }
 }
 
 /// Convenience: create a descriptor set layout from a list of bindings.
@@ -197,8 +343,8 @@ pub fn create_graphics_pipeline(
         .color_write_mask(vk::ColorComponentFlags::all())
         .build()];
 
-    let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
-        .attachments(&color_blend_attachments);
+    let color_blend =
+        vk::PipelineColorBlendStateCreateInfo::builder().attachments(&color_blend_attachments);
 
     // Dynamic state
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
@@ -207,8 +353,8 @@ pub fn create_graphics_pipeline(
 
     // Dynamic rendering info (no render pass)
     let color_formats = [desc.color_attachment_format];
-    let mut rendering_info = vk::PipelineRenderingCreateInfo::builder()
-        .color_attachment_formats(&color_formats);
+    let mut rendering_info =
+        vk::PipelineRenderingCreateInfo::builder().color_attachment_formats(&color_formats);
 
     // Pipeline layout
     let layout_info = vk::PipelineLayoutCreateInfo::builder()
