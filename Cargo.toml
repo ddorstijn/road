@@ -1,7 +1,19 @@
 [workspace]
-members = ["examples/*", "crates/*"]
+members = ["crates/*"]
+exclude = ["crates/shaders"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 keywords = ["vulkan", "bindings", "graphics", "gpu", "rendering"]
+
+# Workaround for LNK1189 (65535 object limit) on Windows when building rustc_codegen_spirv
+[profile.dev.build-override]
+codegen-units = 1
+
+[profile.dev.package.rustc_codegen_spirv]
+opt-level = 2
+codegen-units = 1
+
+[profile.release.build-override]
+codegen-units = 1

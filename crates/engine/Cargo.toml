@@ -7,10 +7,8 @@ edition.workspace = true
 anyhow = "1.0.100"
 bytemuck = { version = "1.25", features = ["derive"] }
 glam = { version = "0.32.0", features = ["bytemuck"] }
+gpu-shared = { path = "../gpu-shared" }
 log = "0.4"
-naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }
-naga_oil = "0.22"
-sha2 = "0.10"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 vulkanalia = "0.35.0"
 vulkanalia-bootstrap = "0.1.8"

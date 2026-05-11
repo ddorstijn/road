@@ -142,7 +142,7 @@ fn closest_point_arc(point: Vec2, length: f32, curvature: f32) -> ClosestPointRe
 fn eval_spiral(s: f32, k_start: f32, k_end: f32, total_length: f32) -> PoseOnSegment {
     // Curvature at parameter t: k(t) = k_start + (k_end - k_start) * t / total_length
     // Heading: theta(t) = k_start * t + 0.5 * (k_end - k_start) * t^2 / total_length
-    // Position: integrate cos(theta), sin(theta) via Taylor series
+    // Position: integrate theta.cos(), theta.sin() via Taylor series
 
     let dk = if total_length > 1e-9 {
         (k_end - k_start) / total_length

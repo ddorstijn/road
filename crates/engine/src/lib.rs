@@ -34,7 +34,7 @@ pub use winit;
 
 pub use crate::core::transition_image;
 pub use crate::pipeline::{
-    destroy_pipeline_cache, init_pipeline_cache, init_shader_compiler, write_storage_buffers,
+    destroy_pipeline_cache, init_pipeline_cache, write_storage_buffers,
     ComputePass,
 };
 

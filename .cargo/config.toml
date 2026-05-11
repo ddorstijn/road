@@ -1,0 +1,1 @@
+# intentionally empty — MSVC linker is used (lld hits DLL export symbol limit)

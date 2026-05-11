@@ -9,7 +9,7 @@ use vulkanalia_bootstrap::Device;
 
 use crate::gpu_resources::GpuBuffer;
 use crate::pipeline::{
-    GraphicsPipelineDesc, allocate_descriptor_set, compile_wgsl, create_descriptor_set_layout,
+    GraphicsPipelineDesc, allocate_descriptor_set, create_descriptor_set_layout,
     create_graphics_pipeline,
 };
 
@@ -43,11 +43,11 @@ pub struct CarRenderer {
 impl CarRenderer {
     /// Create the car rendering pipeline.
     ///
-    /// `car_render_wgsl` is the car rendering shader source (with `#import` directives).
+    /// `spirv` is the pre-compiled SPIR-V bytecode containing vs_main and fs_main entry points.
     pub fn new(
         device: &Device,
         color_attachment_format: vk::Format,
-        car_render_wgsl: &str,
+        spirv: &[u32],
     ) -> anyhow::Result<Self> {
         // 9 storage buffer bindings: 0-4 car SoA, 5-8 road data
         let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..9)
@@ -75,9 +75,6 @@ impl CarRenderer {
         let descriptor_set =
             allocate_descriptor_set(device, descriptor_pool, descriptor_set_layout)?;
 
-        // Compile shader (naga_oil resolves #import directives)
-        let spirv = compile_wgsl(car_render_wgsl)?;
-
         let push_constant_ranges = [vk::PushConstantRange::builder()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
@@ -87,8 +84,8 @@ impl CarRenderer {
         let desc = GraphicsPipelineDesc {
             vertex_spirv: &spirv,
             fragment_spirv: &spirv,
-            vertex_entry: "vs_main",
-            fragment_entry: "fs_main",
+            vertex_entry: "car_render::vs_main",
+            fragment_entry: "car_render::fs_main",
             vertex_binding_descriptions: &[],
             vertex_attribute_descriptions: &[],
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,

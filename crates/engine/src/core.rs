@@ -66,7 +66,9 @@ impl Core {
 
         let features12 = vk::PhysicalDeviceVulkan12Features::builder()
             .buffer_device_address(true)
-            .descriptor_indexing(true);
+            .descriptor_indexing(true)
+            .vulkan_memory_model(true)
+            .vulkan_memory_model_device_scope(true);
 
         let features13 = vk::PhysicalDeviceVulkan13Features::builder()
             .synchronization2(true)

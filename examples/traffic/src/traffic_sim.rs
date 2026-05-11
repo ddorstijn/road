@@ -6,20 +6,8 @@ use engine::{ComputePass, EngineContext};
 use rand::Rng;
 use road::network::RoadNetwork;
 
-// ---------------------------------------------------------------------------
-// Shader sources
-// ---------------------------------------------------------------------------
-
-const CAR_RENDER_WGSL: &str = include_str!("../../../assets/shaders/car_render.wgsl");
-const TRAFFIC_SORT_KEYS_WGSL: &str = include_str!("../../../assets/shaders/traffic_sort_keys.wgsl");
-const TRAFFIC_SORT_HISTOGRAM_WGSL: &str =
-    include_str!("../../../assets/shaders/traffic_sort_histogram.wgsl");
-const TRAFFIC_SORT_SCAN_WGSL: &str = include_str!("../../../assets/shaders/traffic_sort_scan.wgsl");
-const TRAFFIC_SORT_SCATTER_WGSL: &str =
-    include_str!("../../../assets/shaders/traffic_sort_scatter.wgsl");
-const TRAFFIC_IDM_WGSL: &str = include_str!("../../../assets/shaders/traffic_idm.wgsl");
-const TRAFFIC_LANE_CHANGE_WGSL: &str =
-    include_str!("../../../assets/shaders/traffic_lane_change.wgsl");
+use crate::spirv_bytes_to_words;
+use crate::GRID_SPIRV;
 
 // ---------------------------------------------------------------------------
 // Simulation constants
@@ -212,20 +200,22 @@ impl Default for TrafficSim {
 impl TrafficSim {
     pub fn create_pipelines(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
         let device = ctx.device.as_ref();
+        let spirv = spirv_bytes_to_words(GRID_SPIRV);
 
         // Car renderer (instanced rendering)
         {
             self.car_renderer = Some(CarRenderer::new(
                 device,
                 ctx.draw_image.format,
-                CAR_RENDER_WGSL,
+                &spirv,
             )?);
         }
 
         // Sort: build keys (6 SSBOs)
         self.sort_keys_pass = Some(ComputePass::new(
             device,
-            TRAFFIC_SORT_KEYS_WGSL,
+            &spirv,
+            "traffic_sort_keys_main",
             6,
             std::mem::size_of::<SortKeysPushConstants>() as u32,
             1,
@@ -234,7 +224,8 @@ impl TrafficSim {
         // Sort: histogram (2 SSBOs, 2 sets for ping-pong)
         self.sort_histogram_pass = Some(ComputePass::new(
             device,
-            TRAFFIC_SORT_HISTOGRAM_WGSL,
+            &spirv,
+            "traffic_sort_histogram_main",
             2,
             std::mem::size_of::<SortHistogramPushConstants>() as u32,
             2,
@@ -243,7 +234,8 @@ impl TrafficSim {
         // Sort: prefix sum scan (1 SSBO)
         self.sort_scan_pass = Some(ComputePass::new(
             device,
-            TRAFFIC_SORT_SCAN_WGSL,
+            &spirv,
+            "traffic_sort_scan_main",
             1,
             std::mem::size_of::<SortScanPushConstants>() as u32,
             1,
@@ -252,7 +244,8 @@ impl TrafficSim {
         // Sort: scatter (5 SSBOs, 2 sets for ping-pong)
         self.sort_scatter_pass = Some(ComputePass::new(
             device,
-            TRAFFIC_SORT_SCATTER_WGSL,
+            &spirv,
+            "traffic_sort_scatter_main",
             5,
             std::mem::size_of::<SortScatterPushConstants>() as u32,
             2,
@@ -261,7 +254,8 @@ impl TrafficSim {
         // IDM car-following (7 SSBOs)
         self.idm_pass = Some(ComputePass::new(
             device,
-            TRAFFIC_IDM_WGSL,
+            &spirv,
+            "traffic_idm_main",
             7,
             std::mem::size_of::<IdmPushConstants>() as u32,
             1,
@@ -270,7 +264,8 @@ impl TrafficSim {
         // MOBIL lane change (8 SSBOs: car SoA + road_lengths + sorted_indices + road_lane_counts)
         self.mobil_pass = Some(ComputePass::new(
             device,
-            TRAFFIC_LANE_CHANGE_WGSL,
+            &spirv,
+            "traffic_lane_change_main",
             8,
             std::mem::size_of::<MobilPushConstants>() as u32,
             1,

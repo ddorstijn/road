@@ -1,0 +1,19 @@
+[package]
+name = "traffic"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+bytemuck = { version = "1.25", features = ["derive"] }
+engine = { path = "../engine" }
+glam = "0.32"
+gpu-shared = { path = "../gpu-shared" }
+log = "0.4"
+rand = "0.9"
+road = { path = "../road" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+spirv-builder = "0.10.0-alpha.1"

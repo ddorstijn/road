@@ -7,7 +7,7 @@ use vulkanalia_vma as vma;
 
 use crate::gpu_resources::{GpuBuffer, GpuImage};
 use crate::pipeline::{
-    allocate_descriptor_set, compile_wgsl, create_compute_pipeline, create_descriptor_set_layout,
+    allocate_descriptor_set, create_compute_pipeline, create_descriptor_set_layout,
 };
 
 // ---------------------------------------------------------------------------
@@ -217,11 +217,11 @@ pub struct SdfTileManager {
 }
 
 impl SdfTileManager {
-    /// Create the SDF tile manager. Compiles the shader, creates the atlas and pipeline.
+    /// Create the SDF tile manager. Takes pre-compiled SPIR-V, creates the atlas and pipeline.
     pub fn new(
         device: &Arc<Device>,
         allocator: &vma::Allocator,
-        sdf_gen_wgsl: &str,
+        spirv: &[u32],
     ) -> anyhow::Result<Self> {
         // Create atlas image (RGBA16F for signed_dist, s, road_id, unused)
         let atlas = GpuImage::new_storage_2d(
@@ -231,9 +231,6 @@ impl SdfTileManager {
             ATLAS_SIZE,
             vk::Format::R16G16B16A16_SFLOAT,
         )?;
-
-        // Compile the SDF shader (naga_oil resolves #import directives)
-        let spirv = compile_wgsl(sdf_gen_wgsl)?;
 
         // Descriptor set layout:
         //   binding 0: storage image (atlas) — write
@@ -304,7 +301,8 @@ impl SdfTileManager {
 
         let (pipeline, pipeline_layout) = create_compute_pipeline(
             device,
-            &spirv,
+            spirv,
+            "sdf_generate::sdf_generate_main",
             &[descriptor_set_layout],
             &push_constant_ranges,
         )?;

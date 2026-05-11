@@ -1,131 +1,18 @@
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Mutex;
 
-use naga::back::spv;
-use naga_oil::compose::{ComposableModuleDescriptor, Composer, NagaModuleDescriptor};
-use sha2::{Digest, Sha256};
 use vulkanalia::bytecode::Bytecode;
 use vulkanalia::prelude::v1_4::*;
 use vulkanalia_bootstrap::Device;
 
 // ---------------------------------------------------------------------------
-// ShaderCompiler — naga_oil Composer + SPIR-V disk cache
+// Global Vulkan pipeline cache
 // ---------------------------------------------------------------------------
-
-/// Shader compiler that uses naga_oil for modular imports and caches SPIR-V to disk.
-pub struct ShaderCompiler {
-    composer: Composer,
-    cache_dir: PathBuf,
-}
-
-impl ShaderCompiler {
-    /// Create a new shader compiler with disk caching.
-    pub fn new() -> Self {
-        let cache_dir = PathBuf::from("target/shader_cache");
-        let _ = fs::create_dir_all(&cache_dir);
-
-        Self {
-            composer: Composer::default(),
-            cache_dir,
-        }
-    }
-
-    /// Register a shared module (e.g. types.wgsl, road_eval.wgsl).
-    /// The source must contain a `#define_import_path` directive.
-    pub fn add_module(&mut self, source: &str) -> anyhow::Result<()> {
-        let source = source.replace("var<push_constant>", "var<immediate>");
-        self.composer
-            .add_composable_module(ComposableModuleDescriptor {
-                source: &source,
-                file_path: "",
-                ..Default::default()
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to add composable module: {:?}", e))?;
-        Ok(())
-    }
-
-    /// Compile a WGSL shader source (which may contain `#import` directives) to SPIR-V.
-    /// Uses disk cache: if a cached SPIR-V file with matching source hash exists, returns that.
-    pub fn compile(&mut self, source: &str) -> anyhow::Result<Vec<u32>> {
-        // Rewrite `var<push_constant>` → `var<immediate>` for naga compatibility.
-        // Source files use `push_constant` for wgsl-analyzer support; naga uses `immediate`.
-        let source = source.replace("var<push_constant>", "var<immediate>");
-
-        // Compute hash of source (includes imports transitively via composer state)
-        let hash = Self::hash_source(&source);
-        let cache_path = self.cache_dir.join(format!("{}.spv", hash));
-
-        // Try cache hit
-        if let Ok(cached) = fs::read(&cache_path) {
-            if cached.len() % 4 == 0 {
-                let spirv: Vec<u32> = cached
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                return Ok(spirv);
-            }
-        }
-
-        // Cache miss: compose via naga_oil
-        let module = self
-            .composer
-            .make_naga_module(NagaModuleDescriptor {
-                source: &source,
-                file_path: "",
-                ..Default::default()
-            })
-            .map_err(|e| anyhow::anyhow!("Shader composition failed: {:?}", e))?;
-
-        let info = naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .map_err(|e| anyhow::anyhow!("Shader validation failed: {e}"))?;
-
-        let mut options = spv::Options::default();
-        options
-            .flags
-            .insert(spv::WriterFlags::ADJUST_COORDINATE_SPACE);
-
-        let binary = spv::write_vec(&module, &info, &options, None)?;
-
-        // Write to cache
-        let bytes: Vec<u8> = binary.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let _ = fs::write(&cache_path, &bytes);
-
-        Ok(binary)
-    }
-
-    fn hash_source(source: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(source.as_bytes());
-        format!("{:x}", hasher.finalize())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Global ShaderCompiler singleton
-// ---------------------------------------------------------------------------
-
-static SHADER_COMPILER: Mutex<Option<ShaderCompiler>> = Mutex::new(None);
 
 /// Global Vulkan pipeline cache handle (set after device creation).
 static VK_PIPELINE_CACHE: Mutex<Option<vk::PipelineCache>> = Mutex::new(None);
 
 const PIPELINE_CACHE_FILE: &str = "target/shader_cache/vk_pipeline_cache.bin";
-
-/// Initialize the global shader compiler and register shared modules.
-/// Call this once at startup before any shader compilation.
-pub fn init_shader_compiler(shared_modules: &[&str]) -> anyhow::Result<()> {
-    let mut compiler = ShaderCompiler::new();
-    for source in shared_modules {
-        compiler.add_module(source)?;
-    }
-    *SHADER_COMPILER.lock().unwrap() = Some(compiler);
-    Ok(())
-}
 
 /// Create and store a global Vulkan pipeline cache, loading previous data from disk if available.
 pub fn init_pipeline_cache(device: &Device) -> anyhow::Result<()> {
@@ -158,20 +45,12 @@ fn get_vk_pipeline_cache() -> vk::PipelineCache {
         .unwrap_or(vk::PipelineCache::null())
 }
 
-/// Compile WGSL source to SPIR-V using the global shader compiler (naga_oil + cache).
-pub fn compile_wgsl(source: &str) -> anyhow::Result<Vec<u32>> {
-    let mut guard = SHADER_COMPILER.lock().unwrap();
-    let compiler = guard.as_mut().ok_or_else(|| {
-        anyhow::anyhow!("ShaderCompiler not initialized — call init_shader_compiler() first")
-    })?;
-    compiler.compile(source)
-}
-
 /// Create a compute pipeline from SPIR-V words.
 /// Returns `(pipeline, pipeline_layout)`.
 pub fn create_compute_pipeline(
     device: &Device,
     spirv: &[u32],
+    entry_point_name: &str,
     descriptor_set_layouts: &[vk::DescriptorSetLayout],
     push_constant_ranges: &[vk::PushConstantRange],
 ) -> anyhow::Result<(vk::Pipeline, vk::PipelineLayout)> {
@@ -191,11 +70,12 @@ pub fn create_compute_pipeline(
     let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
 
     // Pipeline
-    let entry_point = c"main";
+    let mut entry_buf = entry_point_name.as_bytes().to_vec();
+    entry_buf.push(0);
     let stage_info = vk::PipelineShaderStageCreateInfo::builder()
         .stage(vk::ShaderStageFlags::COMPUTE)
         .module(shader_module)
-        .name(entry_point.to_bytes_with_nul());
+        .name(&entry_buf);
 
     let pipeline_info = vk::ComputePipelineCreateInfo::builder()
         .layout(pipeline_layout)
@@ -234,13 +114,14 @@ pub struct ComputePass {
 }
 
 impl ComputePass {
-    /// Create a compute pass from WGSL source.
+    /// Create a compute pass from pre-compiled SPIR-V.
     ///
     /// `num_storage_buffers` is the number of SSBO bindings (binding 0..N-1).
     /// `num_sets` is how many descriptor sets to allocate (typically 1 or 2 for ping-pong).
     pub fn new(
         device: &Device,
-        wgsl_source: &str,
+        spirv: &[u32],
+        entry_point: &str,
         num_storage_buffers: u32,
         push_constant_size: u32,
         num_sets: u32,
@@ -276,8 +157,6 @@ impl ComputePass {
             )?);
         }
 
-        let spirv = compile_wgsl(wgsl_source)?;
-
         let push_constant_ranges = [vk::PushConstantRange::builder()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
@@ -286,7 +165,8 @@ impl ComputePass {
 
         let (pipeline, pipeline_layout) = create_compute_pipeline(
             device,
-            &spirv,
+            spirv,
+            entry_point,
             &[descriptor_set_layout],
             &push_constant_ranges,
         )?;

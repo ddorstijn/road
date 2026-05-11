@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use engine::gpu_resources::GpuBuffer;
 use engine::gpu_timestamps::GpuTimestamps;
 use engine::pipeline::{
-    GraphicsPipelineDesc, allocate_descriptor_set, compile_wgsl, create_compute_pipeline,
+    GraphicsPipelineDesc, allocate_descriptor_set, create_compute_pipeline,
     create_descriptor_set_layout, create_graphics_pipeline, write_storage_buffers,
 };
 use engine::sdf::{
@@ -24,15 +24,17 @@ use crate::gpu_road_data::{GpuRoadData, segment_type_info};
 use crate::traffic_sim::{SIM_DT, TrafficSim};
 
 // ---------------------------------------------------------------------------
-// Shader sources (rendering only — traffic shaders are in traffic_sim.rs)
+// Pre-compiled SPIR-V shaders (built by spirv-builder in build.rs)
 // ---------------------------------------------------------------------------
 
-const GRID_SHADER: &str = include_str!("../../../assets/shaders/grid.wgsl");
-const ROAD_LINE_SHADER: &str = include_str!("../../../assets/shaders/road_line.wgsl");
-const SDF_TYPES_WGSL: &str = include_str!("../../../assets/shaders/shared/types.wgsl");
-const SDF_ROAD_EVAL_WGSL: &str = include_str!("../../../assets/shaders/shared/road_eval.wgsl");
-const SDF_GENERATE_WGSL: &str = include_str!("../../../assets/shaders/sdf_generate.wgsl");
-const ROAD_RENDER_WGSL: &str = include_str!("../../../assets/shaders/road_render.wgsl");
+pub const GRID_SPIRV: &[u8] = include_bytes!(env!("shaders.spv"));
+
+pub fn spirv_bytes_to_words(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Push constants & vertex types
@@ -216,7 +218,7 @@ impl TrafficApp {
 
         self.update_grid_descriptors(ctx);
 
-        let spirv = compile_wgsl(GRID_SHADER)?;
+        let spirv = spirv_bytes_to_words(GRID_SPIRV);
 
         let push_constant_ranges = [vk::PushConstantRange::builder()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -227,6 +229,7 @@ impl TrafficApp {
         let (pipeline, layout) = create_compute_pipeline(
             device,
             &spirv,
+            "grid_main",
             &[self.grid_descriptor_set_layout],
             &push_constant_ranges,
         )?;
@@ -239,7 +242,7 @@ impl TrafficApp {
 
     fn create_line_pipeline(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
         let device = ctx.device.as_ref();
-        let spirv = compile_wgsl(ROAD_LINE_SHADER)?;
+        let spirv = spirv_bytes_to_words(GRID_SPIRV); // road_line entry points are in same module
 
         let push_constant_ranges = [vk::PushConstantRange::builder()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
@@ -292,13 +295,14 @@ impl TrafficApp {
     fn create_sdf_system(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
         let device = ctx.device.as_ref();
 
+        let sdf_spirv = spirv_bytes_to_words(GRID_SPIRV); // sdf_generate entry point
         let sdf_manager = SdfTileManager::new(
             ctx.device,
             ctx.allocator,
-            SDF_GENERATE_WGSL,
+            &sdf_spirv,
         )?;
 
-        let spirv = compile_wgsl(ROAD_RENDER_WGSL)?;
+        let spirv = spirv_bytes_to_words(GRID_SPIRV); // road_render entry points
 
         let sampler_info = vk::SamplerCreateInfo::builder()
             .mag_filter(vk::Filter::LINEAR)
@@ -1126,8 +1130,6 @@ fn push_cross(vertices: &mut Vec<LineVertex>, pos: Vec2, size: f32, color: [f32;
 
 impl App for TrafficApp {
     fn init(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
-        // Initialize the shader compiler with shared modules
-        engine::init_shader_compiler(&[SDF_TYPES_WGSL, SDF_ROAD_EVAL_WGSL])?;
         // Initialize Vulkan pipeline cache (loads previous cache from disk)
         engine::init_pipeline_cache(ctx.device.as_ref())?;
 
