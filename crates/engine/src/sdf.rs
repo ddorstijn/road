@@ -221,8 +221,6 @@ impl SdfTileManager {
     pub fn new(
         device: &Arc<Device>,
         allocator: &vma::Allocator,
-        types_wgsl: &str,
-        road_eval_wgsl: &str,
         sdf_gen_wgsl: &str,
     ) -> anyhow::Result<Self> {
         // Create atlas image (RGBA16F for signed_dist, s, road_id, unused)
@@ -234,9 +232,8 @@ impl SdfTileManager {
             vk::Format::R16G16B16A16_SFLOAT,
         )?;
 
-        // Compose the full WGSL source by concatenating shared modules
-        let full_source = format!("{}\n{}\n{}", types_wgsl, road_eval_wgsl, sdf_gen_wgsl);
-        let spirv = compile_wgsl(&full_source)?;
+        // Compile the SDF shader (naga_oil resolves #import directives)
+        let spirv = compile_wgsl(sdf_gen_wgsl)?;
 
         // Descriptor set layout:
         //   binding 0: storage image (atlas) — write

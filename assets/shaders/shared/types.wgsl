@@ -1,3 +1,5 @@
+#define_import_path road::types
+
 // Shared GPU types — must match Rust-side GpuSegment, GpuRoad, etc.
 
 struct GpuSegment {

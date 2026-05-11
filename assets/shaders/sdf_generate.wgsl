@@ -1,11 +1,14 @@
+#import road::types::{GpuSegment, TileHeader}
+#import road::eval::{world_to_segment_local, closest_point_on_segment}
+
 // SDF tile generation compute shader.
 //
 // For each texel in the SDF atlas, computes the signed distance to the
 // nearest road segment, along with the s-coordinate and road index.
 //
-// The shared types and road_eval modules are prepended at compile time.
-// They provide: GpuSegment, TileHeader, eval_segment, closest_point_segment,
-//               world_to_segment_local, segment_local_to_world, etc.
+// The shared types and road_eval modules are composed via naga_oil imports.
+// They provide: GpuSegment, TileHeader, closest_point_on_segment,
+//               world_to_segment_local, etc.
 
 // --- Bindings ---
 

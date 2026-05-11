@@ -1,3 +1,6 @@
+#import road::types::{GpuSegment, GpuRoad, GpuLaneSection, GpuLane}
+#import road::eval::{PoseResult, eval_segment, segment_local_to_world}
+
 // Car rendering shader: renders cars as oriented rectangles with visual detail.
 // Instanced drawing: 6 vertices per car (two triangles forming a quad).
 // Reads car SoA SSBOs + road data, evaluates road at (road_id, s) → world position.

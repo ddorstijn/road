@@ -1,3 +1,5 @@
+#import road::types::{GpuRoad, GpuLaneSection, GpuLane}
+
 // Road rendering shader: converts SDF atlas data into final road visuals.
 // Renders asphalt surface, lane markings (solid/dashed, white/yellow),
 // center line, and shoulder with anti-aliased edges.

@@ -295,13 +295,10 @@ impl TrafficApp {
         let sdf_manager = SdfTileManager::new(
             ctx.device,
             ctx.allocator,
-            SDF_TYPES_WGSL,
-            SDF_ROAD_EVAL_WGSL,
             SDF_GENERATE_WGSL,
         )?;
 
-        let full_source = format!("{}\n{}", SDF_TYPES_WGSL, ROAD_RENDER_WGSL);
-        let spirv = compile_wgsl(&full_source)?;
+        let spirv = compile_wgsl(ROAD_RENDER_WGSL)?;
 
         let sampler_info = vk::SamplerCreateInfo::builder()
             .mag_filter(vk::Filter::LINEAR)
@@ -1129,6 +1126,11 @@ fn push_cross(vertices: &mut Vec<LineVertex>, pos: Vec2, size: f32, color: [f32;
 
 impl App for TrafficApp {
     fn init(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
+        // Initialize the shader compiler with shared modules
+        engine::init_shader_compiler(&[SDF_TYPES_WGSL, SDF_ROAD_EVAL_WGSL])?;
+        // Initialize Vulkan pipeline cache (loads previous cache from disk)
+        engine::init_pipeline_cache(ctx.device.as_ref())?;
+
         self.create_grid_pipeline(ctx)?;
         self.create_line_pipeline(ctx)?;
         self.create_sdf_system(ctx)?;
@@ -1232,6 +1234,8 @@ impl App for TrafficApp {
         if let Some(ts) = self.gpu_timestamps.take() {
             ts.destroy(ctx.device.as_ref());
         }
+        // Save and destroy Vulkan pipeline cache
+        engine::destroy_pipeline_cache(ctx.device.as_ref());
     }
 }
 

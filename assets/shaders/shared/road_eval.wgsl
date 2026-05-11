@@ -1,3 +1,5 @@
+#define_import_path road::eval
+
 // Shared road evaluation functions — used by SDF generation and car rendering.
 // Replicates the math from crates/road/src/primitives.rs in WGSL.
 

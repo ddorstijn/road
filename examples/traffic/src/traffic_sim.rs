@@ -10,8 +10,6 @@ use road::network::RoadNetwork;
 // Shader sources
 // ---------------------------------------------------------------------------
 
-const SDF_TYPES_WGSL: &str = include_str!("../../../assets/shaders/shared/types.wgsl");
-const SDF_ROAD_EVAL_WGSL: &str = include_str!("../../../assets/shaders/shared/road_eval.wgsl");
 const CAR_RENDER_WGSL: &str = include_str!("../../../assets/shaders/car_render.wgsl");
 const TRAFFIC_SORT_KEYS_WGSL: &str = include_str!("../../../assets/shaders/traffic_sort_keys.wgsl");
 const TRAFFIC_SORT_HISTOGRAM_WGSL: &str =
@@ -217,11 +215,9 @@ impl TrafficSim {
 
         // Car renderer (instanced rendering)
         {
-            let shared_wgsl = format!("{}\n{}", SDF_TYPES_WGSL, SDF_ROAD_EVAL_WGSL);
             self.car_renderer = Some(CarRenderer::new(
                 device,
                 ctx.draw_image.format,
-                &shared_wgsl,
                 CAR_RENDER_WGSL,
             )?);
         }

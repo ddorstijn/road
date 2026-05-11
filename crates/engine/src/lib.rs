@@ -33,7 +33,10 @@ pub use vulkanalia_vma as vma;
 pub use winit;
 
 pub use crate::core::transition_image;
-pub use crate::pipeline::{write_storage_buffers, ComputePass};
+pub use crate::pipeline::{
+    destroy_pipeline_cache, init_pipeline_cache, init_shader_compiler, write_storage_buffers,
+    ComputePass,
+};
 
 // ---------------------------------------------------------------------------
 // App trait — implemented by the game

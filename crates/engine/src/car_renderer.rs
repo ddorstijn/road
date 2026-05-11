@@ -43,12 +43,10 @@ pub struct CarRenderer {
 impl CarRenderer {
     /// Create the car rendering pipeline.
     ///
-    /// `shared_wgsl` should be the concatenation of shared types + road_eval WGSL sources.
-    /// `car_render_wgsl` is the car rendering shader source.
+    /// `car_render_wgsl` is the car rendering shader source (with `#import` directives).
     pub fn new(
         device: &Device,
         color_attachment_format: vk::Format,
-        shared_wgsl: &str,
         car_render_wgsl: &str,
     ) -> anyhow::Result<Self> {
         // 9 storage buffer bindings: 0-4 car SoA, 5-8 road data
@@ -77,9 +75,8 @@ impl CarRenderer {
         let descriptor_set =
             allocate_descriptor_set(device, descriptor_pool, descriptor_set_layout)?;
 
-        // Compile shader
-        let full_source = format!("{}\n{}\n{}", shared_wgsl, "", car_render_wgsl);
-        let spirv = compile_wgsl(&full_source)?;
+        // Compile shader (naga_oil resolves #import directives)
+        let spirv = compile_wgsl(car_render_wgsl)?;
 
         let push_constant_ranges = [vk::PushConstantRange::builder()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
