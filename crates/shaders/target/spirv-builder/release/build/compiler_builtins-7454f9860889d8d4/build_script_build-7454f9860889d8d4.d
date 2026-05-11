@@ -1,6 +1,0 @@
-C:\Users\danny\Documents\Projects\Road\road-rs\crates\shaders\target\spirv-builder\release\build\compiler_builtins-7454f9860889d8d4\build_script_build-7454f9860889d8d4.d: C:\Users\danny\.rustup\toolchains\nightly-2026-04-11-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\build.rs C:\Users\danny\.rustup\toolchains\nightly-2026-04-11-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\configure.rs
-
-C:\Users\danny\Documents\Projects\Road\road-rs\crates\shaders\target\spirv-builder\release\build\compiler_builtins-7454f9860889d8d4\build_script_build-7454f9860889d8d4.exe: C:\Users\danny\.rustup\toolchains\nightly-2026-04-11-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\build.rs C:\Users\danny\.rustup\toolchains\nightly-2026-04-11-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\configure.rs
-
-C:\Users\danny\.rustup\toolchains\nightly-2026-04-11-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\build.rs:
-C:\Users\danny\.rustup\toolchains\nightly-2026-04-11-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\configure.rs:

@@ -6,8 +6,8 @@ use engine::{ComputePass, EngineContext};
 use rand::Rng;
 use road::network::RoadNetwork;
 
-use crate::spirv_bytes_to_words;
 use crate::GRID_SPIRV;
+use crate::spirv_bytes_to_words;
 
 // ---------------------------------------------------------------------------
 // Simulation constants
@@ -204,11 +204,7 @@ impl TrafficSim {
 
         // Car renderer (instanced rendering)
         {
-            self.car_renderer = Some(CarRenderer::new(
-                device,
-                ctx.draw_image.format,
-                &spirv,
-            )?);
+            self.car_renderer = Some(CarRenderer::new(device, ctx.draw_image.format, &spirv)?);
         }
 
         // Sort: build keys (6 SSBOs)
@@ -480,35 +476,90 @@ impl TrafficSim {
         }
 
         // Unpack required buffers
-        let car_road_id = match &self.car_road_id_buf { Some(b) => b, None => return };
-        let car_s = match &self.car_s_buf { Some(b) => b, None => return };
-        let car_lane = match &self.car_lane_buf { Some(b) => b, None => return };
-        let car_speed = match &self.car_speed_buf { Some(b) => b, None => return };
-        let car_desired = match &self.car_desired_speed_buf { Some(b) => b, None => return };
-        let road_lengths = match &self.road_lengths_buf { Some(b) => b, None => return };
+        let car_road_id = match &self.car_road_id_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let car_s = match &self.car_s_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let car_lane = match &self.car_lane_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let car_speed = match &self.car_speed_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let car_desired = match &self.car_desired_speed_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let road_lengths = match &self.road_lengths_buf {
+            Some(b) => b,
+            None => return,
+        };
 
         // Car renderer descriptors (bindings 0-4: car buffers, 5-8: road data)
         if let (Some(seg_buf), Some(rd_buf), Some(ls_buf), Some(ln_buf)) = (
-            segment_buffer, road_buffer, lane_section_buffer, lane_buffer,
-        ) && let Some(renderer) = &mut self.car_renderer {
+            segment_buffer,
+            road_buffer,
+            lane_section_buffer,
+            lane_buffer,
+        ) && let Some(renderer) = &mut self.car_renderer
+        {
             renderer.update_descriptors(
-                device, car_road_id, car_s, car_lane, car_speed, car_desired,
-                seg_buf, rd_buf, ls_buf, ln_buf,
+                device,
+                car_road_id,
+                car_s,
+                car_lane,
+                car_speed,
+                car_desired,
+                seg_buf,
+                rd_buf,
+                ls_buf,
+                ln_buf,
             );
         }
 
         // Sort buffers
-        let sort_keys_a = match &self.sort_keys_a_buf { Some(b) => b, None => return };
-        let sort_keys_b = match &self.sort_keys_b_buf { Some(b) => b, None => return };
-        let sort_vals_a = match &self.sort_vals_a_buf { Some(b) => b, None => return };
-        let sort_vals_b = match &self.sort_vals_b_buf { Some(b) => b, None => return };
-        let hist_buf = match &self.sort_histogram_buf { Some(b) => b, None => return };
+        let sort_keys_a = match &self.sort_keys_a_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let sort_keys_b = match &self.sort_keys_b_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let sort_vals_a = match &self.sort_vals_a_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let sort_vals_b = match &self.sort_vals_b_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let hist_buf = match &self.sort_histogram_buf {
+            Some(b) => b,
+            None => return,
+        };
 
         // Sort keys: bindings 0-5 = car_road_id, car_s, car_lane, road_lengths, keys_a, vals_a
         if let Some(pass) = &self.sort_keys_pass {
-            write_storage_buffers(device, pass.set(), 0, &[
-                car_road_id, car_s, car_lane, road_lengths, sort_keys_a, sort_vals_a,
-            ]);
+            write_storage_buffers(
+                device,
+                pass.set(),
+                0,
+                &[
+                    car_road_id,
+                    car_s,
+                    car_lane,
+                    road_lengths,
+                    sort_keys_a,
+                    sort_vals_a,
+                ],
+            );
         }
 
         // Sort histogram: set 0 reads A, set 1 reads B
@@ -524,65 +575,113 @@ impl TrafficSim {
 
         // Sort scatter: set 0 = A→B, set 1 = B→A
         if let Some(pass) = &self.sort_scatter_pass {
-            write_storage_buffers(device, pass.set_at(0), 0, &[
-                sort_keys_a, sort_vals_a, sort_keys_b, sort_vals_b, hist_buf,
-            ]);
-            write_storage_buffers(device, pass.set_at(1), 0, &[
-                sort_keys_b, sort_vals_b, sort_keys_a, sort_vals_a, hist_buf,
-            ]);
+            write_storage_buffers(
+                device,
+                pass.set_at(0),
+                0,
+                &[sort_keys_a, sort_vals_a, sort_keys_b, sort_vals_b, hist_buf],
+            );
+            write_storage_buffers(
+                device,
+                pass.set_at(1),
+                0,
+                &[sort_keys_b, sort_vals_b, sort_keys_a, sort_vals_a, hist_buf],
+            );
         }
 
         // IDM: bindings 0-6 = car SoA + road_lengths + sorted_indices
         // After 4 sort passes: final sorted indices are in vals_a
         if let Some(pass) = &self.idm_pass {
-            write_storage_buffers(device, pass.set(), 0, &[
-                car_road_id, car_s, car_lane, car_speed, car_desired, road_lengths, sort_vals_a,
-            ]);
+            write_storage_buffers(
+                device,
+                pass.set(),
+                0,
+                &[
+                    car_road_id,
+                    car_s,
+                    car_lane,
+                    car_speed,
+                    car_desired,
+                    road_lengths,
+                    sort_vals_a,
+                ],
+            );
         }
 
         // MOBIL: bindings 0-7 = car SoA + road_lengths + sorted_indices + road_lane_counts
         if let Some(pass) = &self.mobil_pass
             && let Some(lane_counts) = road_lane_counts_buf
         {
-            write_storage_buffers(device, pass.set(), 0, &[
-                car_road_id, car_s, car_lane, car_speed, car_desired, road_lengths, sort_vals_a,
-                lane_counts,
-            ]);
+            write_storage_buffers(
+                device,
+                pass.set(),
+                0,
+                &[
+                    car_road_id,
+                    car_s,
+                    car_lane,
+                    car_speed,
+                    car_desired,
+                    road_lengths,
+                    sort_vals_a,
+                    lane_counts,
+                ],
+            );
         }
     }
 
-    /// Record GPU commands for one simulation tick (sort → IDM → MOBIL).
-    pub fn dispatch_tick(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
+    /// Record GPU commands for sort key generation and radix sort.
+    pub fn dispatch_sort(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
         let car_count = self.car_count;
         let num_sort_wg = car_count.div_ceil(SORT_TILE_SIZE);
 
-        let sort_keys_pass = match &self.sort_keys_pass { Some(p) => p, None => return };
-        let sort_histogram_pass = match &self.sort_histogram_pass { Some(p) => p, None => return };
-        let sort_scan_pass = match &self.sort_scan_pass { Some(p) => p, None => return };
-        let sort_scatter_pass = match &self.sort_scatter_pass { Some(p) => p, None => return };
-        let idm_pass = match &self.idm_pass { Some(p) => p, None => return };
+        let sort_keys_pass = match &self.sort_keys_pass {
+            Some(p) => p,
+            None => return,
+        };
+        let sort_histogram_pass = match &self.sort_histogram_pass {
+            Some(p) => p,
+            None => return,
+        };
+        let sort_scan_pass = match &self.sort_scan_pass {
+            Some(p) => p,
+            None => return,
+        };
+        let sort_scatter_pass = match &self.sort_scatter_pass {
+            Some(p) => p,
+            None => return,
+        };
 
         let barrier = vk::MemoryBarrier2::builder()
             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE);
-        let dep = vk::DependencyInfo::builder()
-            .memory_barriers(std::slice::from_ref(&barrier));
+        let dep = vk::DependencyInfo::builder().memory_barriers(std::slice::from_ref(&barrier));
 
         unsafe {
             // === Step 1: Build sort keys ===
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, sort_keys_pass.pipeline);
             device.cmd_bind_descriptor_sets(
-                cmd, vk::PipelineBindPoint::COMPUTE, sort_keys_pass.pipeline_layout,
-                0, &[sort_keys_pass.set()], &[],
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                sort_keys_pass.pipeline_layout,
+                0,
+                &[sort_keys_pass.set()],
+                &[],
             );
             let keys_pc = SortKeysPushConstants {
-                car_count, _pad0: 0, _pad1: 0, _pad2: 0,
+                car_count,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             };
             device.cmd_push_constants(
-                cmd, sort_keys_pass.pipeline_layout, vk::ShaderStageFlags::COMPUTE,
-                0, bytemuck::bytes_of(&keys_pc),
+                cmd,
+                sort_keys_pass.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&keys_pc),
             );
             device.cmd_dispatch(cmd, num_sort_wg, 1, 1);
             device.cmd_pipeline_barrier2(cmd, &dep);
@@ -607,59 +706,122 @@ impl TrafficSim {
                 device.cmd_pipeline_barrier2(cmd, &fill_dep);
 
                 // Histogram
-                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, sort_histogram_pass.pipeline);
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    sort_histogram_pass.pipeline,
+                );
                 device.cmd_bind_descriptor_sets(
-                    cmd, vk::PipelineBindPoint::COMPUTE, sort_histogram_pass.pipeline_layout,
-                    0, &[sort_histogram_pass.set_at(set_idx)], &[],
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    sort_histogram_pass.pipeline_layout,
+                    0,
+                    &[sort_histogram_pass.set_at(set_idx)],
+                    &[],
                 );
                 let hist_pc = SortHistogramPushConstants {
-                    pass_id: pass, car_count, num_workgroups: num_sort_wg, _pad: 0,
+                    pass_id: pass,
+                    car_count,
+                    num_workgroups: num_sort_wg,
+                    _pad: 0,
                 };
                 device.cmd_push_constants(
-                    cmd, sort_histogram_pass.pipeline_layout, vk::ShaderStageFlags::COMPUTE,
-                    0, bytemuck::bytes_of(&hist_pc),
+                    cmd,
+                    sort_histogram_pass.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    bytemuck::bytes_of(&hist_pc),
                 );
                 device.cmd_dispatch(cmd, num_sort_wg, 1, 1);
                 device.cmd_pipeline_barrier2(cmd, &dep);
 
                 // Prefix sum (scan)
-                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, sort_scan_pass.pipeline);
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    sort_scan_pass.pipeline,
+                );
                 device.cmd_bind_descriptor_sets(
-                    cmd, vk::PipelineBindPoint::COMPUTE, sort_scan_pass.pipeline_layout,
-                    0, &[sort_scan_pass.set()], &[],
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    sort_scan_pass.pipeline_layout,
+                    0,
+                    &[sort_scan_pass.set()],
+                    &[],
                 );
                 let scan_pc = SortScanPushConstants {
-                    num_workgroups: num_sort_wg, _pad0: 0, _pad1: 0, _pad2: 0,
+                    num_workgroups: num_sort_wg,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
                 };
                 device.cmd_push_constants(
-                    cmd, sort_scan_pass.pipeline_layout, vk::ShaderStageFlags::COMPUTE,
-                    0, bytemuck::bytes_of(&scan_pc),
+                    cmd,
+                    sort_scan_pass.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    bytemuck::bytes_of(&scan_pc),
                 );
                 device.cmd_dispatch(cmd, 1, 1, 1);
                 device.cmd_pipeline_barrier2(cmd, &dep);
 
                 // Scatter
-                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, sort_scatter_pass.pipeline);
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    sort_scatter_pass.pipeline,
+                );
                 device.cmd_bind_descriptor_sets(
-                    cmd, vk::PipelineBindPoint::COMPUTE, sort_scatter_pass.pipeline_layout,
-                    0, &[sort_scatter_pass.set_at(set_idx)], &[],
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    sort_scatter_pass.pipeline_layout,
+                    0,
+                    &[sort_scatter_pass.set_at(set_idx)],
+                    &[],
                 );
                 let scatter_pc = SortScatterPushConstants {
-                    pass_id: pass, car_count, num_workgroups: num_sort_wg, _pad: 0,
+                    pass_id: pass,
+                    car_count,
+                    num_workgroups: num_sort_wg,
+                    _pad: 0,
                 };
                 device.cmd_push_constants(
-                    cmd, sort_scatter_pass.pipeline_layout, vk::ShaderStageFlags::COMPUTE,
-                    0, bytemuck::bytes_of(&scatter_pc),
+                    cmd,
+                    sort_scatter_pass.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    bytemuck::bytes_of(&scatter_pc),
                 );
                 device.cmd_dispatch(cmd, num_sort_wg, 1, 1);
                 device.cmd_pipeline_barrier2(cmd, &dep);
             }
+        }
+    }
 
-            // === Step 3: IDM car-following ===
+    /// Record GPU commands for IDM car-following dynamics.
+    pub fn dispatch_idm(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
+        let car_count = self.car_count;
+        let idm_pass = match &self.idm_pass {
+            Some(p) => p,
+            None => return,
+        };
+
+        let barrier = vk::MemoryBarrier2::builder()
+            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE);
+        let dep = vk::DependencyInfo::builder().memory_barriers(std::slice::from_ref(&barrier));
+
+        unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, idm_pass.pipeline);
             device.cmd_bind_descriptor_sets(
-                cmd, vk::PipelineBindPoint::COMPUTE, idm_pass.pipeline_layout,
-                0, &[idm_pass.set()], &[],
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                idm_pass.pipeline_layout,
+                0,
+                &[idm_pass.set()],
+                &[],
             );
             let idm_pc = IdmPushConstants {
                 dt: SIM_DT,
@@ -672,8 +834,11 @@ impl TrafficSim {
                 _pad: 0,
             };
             device.cmd_push_constants(
-                cmd, idm_pass.pipeline_layout, vk::ShaderStageFlags::COMPUTE,
-                0, bytemuck::bytes_of(&idm_pc),
+                cmd,
+                idm_pass.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&idm_pc),
             );
             device.cmd_dispatch(cmd, car_count.div_ceil(256), 1, 1);
             device.cmd_pipeline_barrier2(cmd, &dep);
@@ -682,21 +847,27 @@ impl TrafficSim {
 
     /// Record GPU commands for MOBIL lane change evaluation.
     pub fn dispatch_lane_change(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
-        let mobil_pass = match &self.mobil_pass { Some(p) => p, None => return };
+        let mobil_pass = match &self.mobil_pass {
+            Some(p) => p,
+            None => return,
+        };
 
         let barrier = vk::MemoryBarrier2::builder()
             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE);
-        let dep = vk::DependencyInfo::builder()
-            .memory_barriers(std::slice::from_ref(&barrier));
+        let dep = vk::DependencyInfo::builder().memory_barriers(std::slice::from_ref(&barrier));
 
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, mobil_pass.pipeline);
             device.cmd_bind_descriptor_sets(
-                cmd, vk::PipelineBindPoint::COMPUTE, mobil_pass.pipeline_layout,
-                0, &[mobil_pass.set()], &[],
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                mobil_pass.pipeline_layout,
+                0,
+                &[mobil_pass.set()],
+                &[],
             );
             let mobil_pc = MobilPushConstants {
                 car_count: self.car_count,
@@ -713,8 +884,11 @@ impl TrafficSim {
                 _pad: 0,
             };
             device.cmd_push_constants(
-                cmd, mobil_pass.pipeline_layout, vk::ShaderStageFlags::COMPUTE,
-                0, bytemuck::bytes_of(&mobil_pc),
+                cmd,
+                mobil_pass.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&mobil_pc),
             );
             device.cmd_dispatch(cmd, self.car_count.div_ceil(256), 1, 1);
             device.cmd_pipeline_barrier2(cmd, &dep);

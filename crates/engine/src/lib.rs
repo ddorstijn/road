@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod car_renderer;
 pub mod core;
+pub mod gpu_pipeline_stats;
 pub mod gpu_resources;
 pub mod gpu_timestamps;
 pub mod pipeline;
@@ -34,8 +35,7 @@ pub use winit;
 
 pub use crate::core::transition_image;
 pub use crate::pipeline::{
-    destroy_pipeline_cache, init_pipeline_cache, write_storage_buffers,
-    ComputePass,
+    destroy_pipeline_cache, init_pipeline_cache, write_storage_buffers, ComputePass,
 };
 
 // ---------------------------------------------------------------------------

@@ -74,8 +74,12 @@ impl Core {
             .synchronization2(true)
             .dynamic_rendering(true);
 
+        let base_features = vk::PhysicalDeviceFeatures::builder()
+            .pipeline_statistics_query(true);
+
         let physical_device = PhysicalDeviceSelector::new(instance.clone())
             .preferred_device_type(PreferredDeviceType::Discrete)
+            .add_required_features(*base_features)
             .add_required_extension_feature(*features12)
             .add_required_extension_feature(*features13)
             .select()?;
