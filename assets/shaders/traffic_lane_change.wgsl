@@ -1,4 +1,8 @@
 // MOBIL (Minimizing Overall Braking Induced by Lane changes) lane change shader.
+// European model: asymmetric keep-right rule. Cars prefer the rightmost lane
+// unless overtaking a slower vehicle. Returning right has a lower threshold
+// and a positive bias incentive.
+//
 // Dispatched every Nth simulation tick to reduce cost.
 // For each car, checks adjacent lanes for incentive and safety criteria.
 //
@@ -15,12 +19,14 @@ struct PushConstants {
     time_headway: f32,
     car_length: f32,
     // MOBIL parameters
-    politeness: f32,   // p: politeness factor, typically 0.5
-    threshold: f32,    // Minimum incentive (m/s²), typically 0.2
-    b_safe: f32,       // Maximum safe deceleration for follower (m/s²), typically 4.0
-    max_right_lanes: i32, // Max right lane index (0-based)
-    max_left_lanes: i32,  // Max left lane count (negative index)
-    _pad: u32,
+    politeness: f32,       // p: politeness factor, typically 0.5
+    threshold: f32,        // Minimum incentive for overtaking (m/s²), typically 0.5
+    b_safe: f32,           // Maximum safe deceleration for follower (m/s²), typically 4.0
+    max_right_lanes: i32,  // Max right lane index (0-based)
+    max_left_lanes: i32,   // Max left lane count (negative index)
+    stagger_phase: u32,    // Stagger phase for distributing evaluations
+    keep_right_bias: f32,  // Incentive bias for returning to the right lane (m/s²)
+    _pad: vec3<u32>,
 }
 
 var<immediate> pc: PushConstants;
@@ -219,7 +225,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // --- Stagger: only ~1/4 of cars evaluate lane changes per dispatch ---
     // Use a simple hash of car_idx to determine eligibility.
     // This prevents many neighbouring cars from switching simultaneously.
-    if (car_idx % 4u) != (pc._pad % 4u) {
+    if (car_idx % 4u) != (pc.stagger_phase % 4u) {
         return;
     }
 
@@ -292,11 +298,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
-        // MOBIL incentive criterion: gain for us minus politeness-weighted loss for follower
-        // Simplified: only consider our gain (follower impact already guarded by safety check)
-        let incentive = a_target - a_current;
+        // MOBIL incentive criterion (European asymmetric model)
+        // Rightward = toward lane 0: keep-right bias is added, threshold is 0.
+        // Leftward = overtaking: no bias, full threshold required.
+        let is_rightward = (lane >= 0 && target_lane < lane) || (lane < 0 && target_lane > lane);
+        var incentive = a_target - a_current;
+        var effective_threshold = pc.threshold;
 
-        if incentive > pc.threshold && incentive > best_incentive {
+        if is_rightward {
+            // European keep-right: add bias to encourage returning right
+            incentive += pc.keep_right_bias;
+            // Lower threshold: move right even without a speed advantage
+            effective_threshold = 0.0;
+        }
+
+        if incentive > effective_threshold && incentive > best_incentive {
             best_incentive = incentive;
             best_lane = target_lane;
         }

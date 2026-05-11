@@ -92,6 +92,8 @@ pub struct InputState {
     pub escape_pressed: bool,
     /// Keys pressed this frame (one-shot, cleared each frame).
     pub keys_pressed: HashSet<winit::keyboard::Key>,
+    /// Keys currently held down.
+    pub keys_held: HashSet<winit::keyboard::Key>,
 }
 
 impl InputState {
@@ -257,6 +259,9 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                         self.input.escape_pressed = true;
                     }
                     self.input.keys_pressed.insert(event.logical_key.clone());
+                    self.input.keys_held.insert(event.logical_key.clone());
+                } else {
+                    self.input.keys_held.remove(&event.logical_key);
                 }
             }
 
@@ -279,6 +284,24 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                             window_extent.width,
                             window_extent.height,
                         );
+                    }
+
+                    // Camera: arrow key panning
+                    {
+                        use winit::keyboard::{Key, NamedKey};
+                        let pan_speed = 2.0 / self.camera.zoom * self.dt;
+                        if self.input.keys_held.contains(&Key::Named(NamedKey::ArrowLeft)) {
+                            self.camera.position.x -= pan_speed;
+                        }
+                        if self.input.keys_held.contains(&Key::Named(NamedKey::ArrowRight)) {
+                            self.camera.position.x += pan_speed;
+                        }
+                        if self.input.keys_held.contains(&Key::Named(NamedKey::ArrowDown)) {
+                            self.camera.position.y -= pan_speed;
+                        }
+                        if self.input.keys_held.contains(&Key::Named(NamedKey::ArrowUp)) {
+                            self.camera.position.y += pan_speed;
+                        }
                     }
 
                     // Camera: scroll zoom centered on cursor

@@ -24,14 +24,14 @@
     "cars": [
         {
             "road_id": 0,
-            "lane": 0,
+            "lane": 1,
             "s": 200.0,
             "speed": 20.0,
             "desired_speed": 20.0
         },
         {
             "road_id": 0,
-            "lane": 0,
+            "lane": 1,
             "s": 50.0,
             "speed": 35.0,
             "desired_speed": 35.0

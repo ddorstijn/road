@@ -578,6 +578,7 @@ impl TrafficApp {
             self.gpu_road_data.road_buffer.as_ref(),
             self.gpu_road_data.lane_section_buffer.as_ref(),
             self.gpu_road_data.lane_buffer.as_ref(),
+            self.gpu_road_data.road_lane_counts_buf.as_ref(),
         );
 
         self.dirty = false;

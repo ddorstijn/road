@@ -71,6 +71,8 @@ pub struct GpuRoadData {
     pub road_buffer: Option<GpuBuffer>,
     pub lane_section_buffer: Option<GpuBuffer>,
     pub lane_buffer: Option<GpuBuffer>,
+    /// Per-road lane counts: [right_lane_count, left_lane_count] as u32 pairs.
+    pub road_lane_counts_buf: Option<GpuBuffer>,
 }
 
 impl GpuRoadData {
@@ -80,6 +82,7 @@ impl GpuRoadData {
             road_buffer: None,
             lane_section_buffer: None,
             lane_buffer: None,
+            road_lane_counts_buf: None,
         }
     }
 
@@ -94,6 +97,9 @@ impl GpuRoadData {
             b.destroy(allocator);
         }
         if let Some(b) = self.lane_buffer.take() {
+            b.destroy(allocator);
+        }
+        if let Some(b) = self.road_lane_counts_buf.take() {
             b.destroy(allocator);
         }
     }
@@ -199,6 +205,26 @@ impl GpuRoadData {
             let (buf, ptr) = GpuBuffer::new_mapped(allocator, data.len() as u64, usage)?;
             unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
             self.lane_buffer = Some(buf);
+        }
+
+        // Per-road lane counts: [right_count, left_count] per road
+        {
+            let mut lane_counts: Vec<[u32; 2]> = Vec::with_capacity(network.roads.len());
+            for road_data in &network.roads {
+                let (right, left) = if road_data.lane_sections.is_empty() {
+                    (1u32, 0u32)
+                } else {
+                    (
+                        road_data.lane_sections[0].right_lanes.len() as u32,
+                        road_data.lane_sections[0].left_lanes.len() as u32,
+                    )
+                };
+                lane_counts.push([right, left]);
+            }
+            let data = bytemuck::cast_slice::<_, u8>(&lane_counts);
+            let (buf, ptr) = GpuBuffer::new_mapped(allocator, data.len() as u64, usage)?;
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
+            self.road_lane_counts_buf = Some(buf);
         }
 
         Ok(())

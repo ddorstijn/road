@@ -58,15 +58,17 @@ const IDM_TIME_HEADWAY: f32 = 1.5;
 const CAR_LENGTH: f32 = 4.5;
 
 // ---------------------------------------------------------------------------
-// MOBIL parameters
+// MOBIL parameters (European model: asymmetric keep-right rule)
 // ---------------------------------------------------------------------------
 
 /// Politeness factor
 const MOBIL_POLITENESS: f32 = 0.5;
-/// Lane change incentive threshold
+/// Lane change incentive threshold (for overtaking / leftward moves)
 const MOBIL_THRESHOLD: f32 = 0.5;
 /// Maximum safe braking for follower (m/s²)
 const MOBIL_B_SAFE: f32 = 4.0;
+/// Keep-right bias: added incentive for returning to the rightmost lane (m/s²)
+const MOBIL_KEEP_RIGHT_BIAS: f32 = 0.3;
 /// Number of right lanes available (0, 1)
 const MOBIL_MAX_RIGHT_LANES: i32 = 2;
 /// Number of left lanes available (-1, -2)
@@ -140,6 +142,8 @@ struct MobilPushConstants {
     max_right_lanes: i32,
     max_left_lanes: i32,
     stagger_phase: u32,
+    keep_right_bias: f32,
+    _pad: [u32; 3],
 }
 
 // ---------------------------------------------------------------------------
@@ -717,7 +721,9 @@ impl TrafficSim {
                 b_safe: MOBIL_B_SAFE,
                 max_right_lanes: MOBIL_MAX_RIGHT_LANES,
                 max_left_lanes: MOBIL_MAX_LEFT_LANES,
-                stagger_phase: self.sim_tick,
+                stagger_phase: self.sim_tick / LANE_CHANGE_INTERVAL,
+                keep_right_bias: MOBIL_KEEP_RIGHT_BIAS,
+                _pad: [0; 3],
             };
             device.cmd_push_constants(
                 cmd, mobil_pass.pipeline_layout, vk::ShaderStageFlags::COMPUTE,
