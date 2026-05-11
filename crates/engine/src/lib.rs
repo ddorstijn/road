@@ -290,16 +290,32 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                     {
                         use winit::keyboard::{Key, NamedKey};
                         let pan_speed = 2.0 / self.camera.zoom * self.dt;
-                        if self.input.keys_held.contains(&Key::Named(NamedKey::ArrowLeft)) {
+                        if self
+                            .input
+                            .keys_held
+                            .contains(&Key::Named(NamedKey::ArrowLeft))
+                        {
                             self.camera.position.x -= pan_speed;
                         }
-                        if self.input.keys_held.contains(&Key::Named(NamedKey::ArrowRight)) {
+                        if self
+                            .input
+                            .keys_held
+                            .contains(&Key::Named(NamedKey::ArrowRight))
+                        {
                             self.camera.position.x += pan_speed;
                         }
-                        if self.input.keys_held.contains(&Key::Named(NamedKey::ArrowDown)) {
+                        if self
+                            .input
+                            .keys_held
+                            .contains(&Key::Named(NamedKey::ArrowDown))
+                        {
                             self.camera.position.y -= pan_speed;
                         }
-                        if self.input.keys_held.contains(&Key::Named(NamedKey::ArrowUp)) {
+                        if self
+                            .input
+                            .keys_held
+                            .contains(&Key::Named(NamedKey::ArrowUp))
+                        {
                             self.camera.position.y += pan_speed;
                         }
                     }

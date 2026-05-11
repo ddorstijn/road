@@ -19,14 +19,12 @@ struct PushConstants {
     time_headway: f32,
     car_length: f32,
     // MOBIL parameters
-    politeness: f32,       // p: politeness factor, typically 0.5
-    threshold: f32,        // Minimum incentive for overtaking (m/s²), typically 0.5
+    politeness: f32,       // p: politeness factor, typically 0.3
+    threshold: f32,        // Minimum incentive for overtaking (m/s²), typically 0.2
     b_safe: f32,           // Maximum safe deceleration for follower (m/s²), typically 4.0
-    max_right_lanes: i32,  // Max right lane index (0-based)
-    max_left_lanes: i32,   // Max left lane count (negative index)
     stagger_phase: u32,    // Stagger phase for distributing evaluations
     keep_right_bias: f32,  // Incentive bias for returning to the right lane (m/s²)
-    _pad: vec3<u32>,
+    _pad: u32,
 }
 
 var<immediate> pc: PushConstants;
@@ -41,6 +39,9 @@ var<immediate> pc: PushConstants;
 
 // Sorted indices
 @group(0) @binding(6) var<storage, read> sorted_indices: array<u32>;
+
+// Per-road lane counts: x = right_lane_count, y = left_lane_count
+@group(0) @binding(7) var<storage, read> road_lane_counts: array<vec2<u32>>;
 
 /// IDM acceleration computation (same as in traffic_idm.wgsl)
 fn idm_accel(v: f32, v0: f32, delta_v: f32, gap: f32) -> f32 {
@@ -84,16 +85,17 @@ fn directional_follower_gap(my_s: f32, other_s: f32, road_len: f32, is_left: boo
 }
 
 /// Find the nearest LEADER (car ahead in travel direction) in `target_lane`.
-/// Returns vec2(gap, leader_speed). gap = 1000.0 means no leader found.
+/// Returns vec3(gap, leader_speed, leader_desired_speed). gap = 1000.0 means no leader found.
 fn find_leader_in_lane(
     road_id: u32,
     target_lane: i32,
     s: f32,
     road_len: f32,
     sorted_idx: u32,
-) -> vec2<f32> {
+) -> vec3<f32> {
     var best_gap = 1000.0;
     var best_speed = 0.0;
+    var best_desired = 0.0;
     let max_scan = 512u;
     let is_left = target_lane < 0;
 
@@ -111,6 +113,7 @@ fn find_leader_in_lane(
             if g >= 0.0 && g < best_gap {
                 best_gap = g;
                 best_speed = car_speed[idx];
+                best_desired = car_desired_speed[idx];
             }
         } else if passed_target {
             break;
@@ -134,6 +137,7 @@ fn find_leader_in_lane(
                 if g >= 0.0 && g < best_gap {
                     best_gap = g;
                     best_speed = car_speed[idx];
+                    best_desired = car_desired_speed[idx];
                 }
             } else if passed_target {
                 break;
@@ -145,20 +149,21 @@ fn find_leader_in_lane(
         }
     }
 
-    return vec2<f32>(best_gap, best_speed);
+    return vec3<f32>(best_gap, best_speed, best_desired);
 }
 
 /// Find the nearest FOLLOWER (car behind in travel direction) in `target_lane`.
-/// Returns vec2(gap, follower_speed). gap = 1000.0 means no follower.
+/// Returns vec3(gap, follower_speed, follower_desired_speed). gap = 1000.0 means no follower.
 fn find_follower_in_lane(
     road_id: u32,
     target_lane: i32,
     s: f32,
     road_len: f32,
     sorted_idx: u32,
-) -> vec2<f32> {
+) -> vec3<f32> {
     var best_gap = 1000.0;
     var best_speed = 0.0;
+    var best_desired = 0.0;
     let max_scan = 512u;
     let is_left = target_lane < 0;
 
@@ -176,6 +181,7 @@ fn find_follower_in_lane(
             if g >= 0.0 && g < best_gap {
                 best_gap = g;
                 best_speed = car_speed[idx];
+                best_desired = car_desired_speed[idx];
             }
         } else if passed_target {
             break;
@@ -199,6 +205,7 @@ fn find_follower_in_lane(
                 if g >= 0.0 && g < best_gap {
                     best_gap = g;
                     best_speed = car_speed[idx];
+                    best_desired = car_desired_speed[idx];
                 }
             } else if passed_target {
                 break;
@@ -210,7 +217,7 @@ fn find_follower_in_lane(
         }
     }
 
-    return vec2<f32>(best_gap, best_speed);
+    return vec3<f32>(best_gap, best_speed, best_desired);
 }
 
 @compute @workgroup_size(256)
@@ -223,8 +230,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let car_idx = sorted_indices[sorted_idx];
 
     // --- Stagger: only ~1/4 of cars evaluate lane changes per dispatch ---
-    // Use a simple hash of car_idx to determine eligibility.
-    // This prevents many neighbouring cars from switching simultaneously.
     if (car_idx % 4u) != (pc.stagger_phase % 4u) {
         return;
     }
@@ -236,6 +241,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let desired_speed = car_desired_speed[car_idx];
     let road_len = road_total_lengths[road_id];
 
+    // Per-road lane counts
+    let lane_counts = road_lane_counts[road_id];
+    let max_right = i32(lane_counts.x);
+    let max_left = i32(lane_counts.y);
+
     // Find current lane acceleration (with current leader)
     let cur_leader = find_leader_in_lane(road_id, lane, s, road_len, sorted_idx);
     let a_current = idm_accel(speed, desired_speed, speed - cur_leader.y, cur_leader.x);
@@ -244,8 +254,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var best_lane = lane;
     var best_incentive = 0.0;
 
-    // Minimum gap required in target lane (leader AND follower) to allow change
-    let min_gap = pc.car_length * 3.0; // ~13.5m
+    // Minimum gap required in target lane (leader AND follower) to allow change.
+    // Speed-dependent: at least 1 headway distance, never less than 2 car lengths.
+    let min_gap = max(pc.car_length * 2.0, speed * pc.time_headway);
 
     for (var dir = -1; dir <= 1; dir += 2) {
         let target_lane = lane + dir;
@@ -260,11 +271,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             continue;
         }
 
-        // Check lane bounds
-        if target_lane >= 0 && target_lane >= pc.max_right_lanes {
+        // Check lane bounds (per-road)
+        if target_lane >= 0 && target_lane >= max_right {
             continue;
         }
-        if target_lane < 0 && target_lane < -pc.max_left_lanes {
+        if target_lane < 0 && target_lane < -max_left {
             continue;
         }
 
@@ -279,6 +290,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Find follower in target lane
         let tgt_follower = find_follower_in_lane(road_id, target_lane, s, road_len, sorted_idx);
         let follower_speed = tgt_follower.y;
+        let follower_desired = tgt_follower.z;
         let follower_gap = tgt_follower.x;
 
         // Reject if follower too close
@@ -286,23 +298,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             continue;
         }
 
+        // Determine direction: rightward = away from center (toward the road edge)
+        //   Right lanes (>=0): higher lane index is further right
+        //   Left lanes (<0): more negative lane index is further right (from that driver's POV)
+        let is_rightward = (lane >= 0 && target_lane > lane) || (lane < 0 && target_lane < lane);
+
+        // When returning right, require extra clearance behind us (the car we just overtook).
+        if is_rightward && follower_gap < speed * pc.time_headway * 2.0 {
+            continue;
+        }
+
+        // Don't return right if there's a slower car close ahead — we'd overtake again immediately.
+        let keep_left_dist = speed * pc.time_headway * 3.0 + pc.car_length * 4.0;
+        if is_rightward && tgt_leader.x < keep_left_dist && tgt_leader.y < speed * 0.85 {
+            continue;
+        }
+
         // Safety criterion: follower must not need to brake harder than b_safe
+        // Also compute follower's old acceleration (before ego enters) for politeness term
+        var a_follower_new = 0.0;
+        var a_follower_old = 0.0;
         if follower_gap < 999.0 {
-            let a_follower_new = idm_accel(
-                follower_speed, follower_speed,
+            // Follower's acceleration if ego enters the target lane
+            a_follower_new = idm_accel(
+                follower_speed, follower_desired,
                 follower_speed - speed,
                 follower_gap,
             );
             if a_follower_new < -pc.b_safe {
                 continue;
             }
+
+            // Follower's current acceleration with its own leader in the target lane
+            // Approximate: follower's gap to that leader = tgt_leader.x + follower_gap + car_length
+            let follower_leader_gap = tgt_leader.x + follower_gap + pc.car_length;
+            a_follower_old = idm_accel(
+                follower_speed, follower_desired,
+                follower_speed - tgt_leader.y,
+                follower_leader_gap,
+            );
         }
 
         // MOBIL incentive criterion (European asymmetric model)
-        // Rightward = toward lane 0: keep-right bias is added, threshold is 0.
-        // Leftward = overtaking: no bias, full threshold required.
-        let is_rightward = (lane >= 0 && target_lane < lane) || (lane < 0 && target_lane > lane);
-        var incentive = a_target - a_current;
+        var incentive = (a_target - a_current) + pc.politeness * (a_follower_new - a_follower_old);
         var effective_threshold = pc.threshold;
 
         if is_rightward {

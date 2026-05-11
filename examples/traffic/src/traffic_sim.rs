@@ -62,17 +62,13 @@ const CAR_LENGTH: f32 = 4.5;
 // ---------------------------------------------------------------------------
 
 /// Politeness factor
-const MOBIL_POLITENESS: f32 = 0.5;
+const MOBIL_POLITENESS: f32 = 0.3;
 /// Lane change incentive threshold (for overtaking / leftward moves)
-const MOBIL_THRESHOLD: f32 = 0.5;
+const MOBIL_THRESHOLD: f32 = 0.2;
 /// Maximum safe braking for follower (m/s²)
 const MOBIL_B_SAFE: f32 = 4.0;
 /// Keep-right bias: added incentive for returning to the rightmost lane (m/s²)
 const MOBIL_KEEP_RIGHT_BIAS: f32 = 0.3;
-/// Number of right lanes available (0, 1)
-const MOBIL_MAX_RIGHT_LANES: i32 = 2;
-/// Number of left lanes available (-1, -2)
-const MOBIL_MAX_LEFT_LANES: i32 = 2;
 
 // ---------------------------------------------------------------------------
 // Push constants
@@ -139,11 +135,9 @@ struct MobilPushConstants {
     politeness: f32,
     threshold: f32,
     b_safe: f32,
-    max_right_lanes: i32,
-    max_left_lanes: i32,
     stagger_phase: u32,
     keep_right_bias: f32,
-    _pad: [u32; 3],
+    _pad: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -277,11 +271,11 @@ impl TrafficSim {
             1,
         )?);
 
-        // MOBIL lane change (7 SSBOs)
+        // MOBIL lane change (8 SSBOs: car SoA + road_lengths + sorted_indices + road_lane_counts)
         self.mobil_pass = Some(ComputePass::new(
             device,
             TRAFFIC_LANE_CHANGE_WGSL,
-            7,
+            8,
             std::mem::size_of::<MobilPushConstants>() as u32,
             1,
         )?);
@@ -488,6 +482,7 @@ impl TrafficSim {
         road_buffer: Option<&GpuBuffer>,
         lane_section_buffer: Option<&GpuBuffer>,
         lane_buffer: Option<&GpuBuffer>,
+        road_lane_counts_buf: Option<&GpuBuffer>,
     ) {
         if !self.initialized {
             return;
@@ -554,10 +549,13 @@ impl TrafficSim {
             ]);
         }
 
-        // MOBIL: same layout as IDM
-        if let Some(pass) = &self.mobil_pass {
+        // MOBIL: bindings 0-7 = car SoA + road_lengths + sorted_indices + road_lane_counts
+        if let Some(pass) = &self.mobil_pass
+            && let Some(lane_counts) = road_lane_counts_buf
+        {
             write_storage_buffers(device, pass.set(), 0, &[
                 car_road_id, car_s, car_lane, car_speed, car_desired, road_lengths, sort_vals_a,
+                lane_counts,
             ]);
         }
     }
@@ -719,11 +717,9 @@ impl TrafficSim {
                 politeness: MOBIL_POLITENESS,
                 threshold: MOBIL_THRESHOLD,
                 b_safe: MOBIL_B_SAFE,
-                max_right_lanes: MOBIL_MAX_RIGHT_LANES,
-                max_left_lanes: MOBIL_MAX_LEFT_LANES,
                 stagger_phase: self.sim_tick / LANE_CHANGE_INTERVAL,
                 keep_right_bias: MOBIL_KEEP_RIGHT_BIAS,
-                _pad: [0; 3],
+                _pad: 0,
             };
             device.cmd_push_constants(
                 cmd, mobil_pass.pipeline_layout, vk::ShaderStageFlags::COMPUTE,

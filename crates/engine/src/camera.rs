@@ -13,7 +13,7 @@ impl Default for Camera2D {
     fn default() -> Self {
         Self {
             position: Vec2::ZERO,
-            zoom: 0.25,
+            zoom: 0.005,
         }
     }
 }
