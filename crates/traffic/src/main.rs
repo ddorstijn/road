@@ -899,10 +899,10 @@ impl TrafficApp {
                 }
             }
 
-            // MOBIL lane change
-            if self.traffic.should_lane_change() {
-                self.traffic.dispatch_lane_change(device, cmd);
-            }
+            // MOBIL lane change (disabled for testing)
+            //if self.traffic.should_lane_change() {
+            //    self.traffic.dispatch_lane_change(device, cmd);
+            //}
             if stamp {
                 if let Some(ts) = &mut self.gpu_timestamps {
                     ts.write_phase(device, cmd);

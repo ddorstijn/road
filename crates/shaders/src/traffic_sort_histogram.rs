@@ -1,4 +1,4 @@
-use glam::UVec3;
+use spirv_std::glam::UVec3;
 use spirv_std::spirv;
 
 #[repr(C)]
@@ -39,4 +39,3 @@ pub fn traffic_sort_histogram_main(
         }
     }
 }
-

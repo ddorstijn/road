@@ -1,4 +1,4 @@
-use glam::UVec3;
+use spirv_std::glam::UVec3;
 use spirv_std::num_traits::Float;
 use spirv_std::spirv;
 
@@ -133,19 +133,29 @@ pub fn traffic_idm_main(
         new_speed = 0.0;
     }
     new_speed = new_speed.max(0.0).min(desired_speed * 1.5);
+    // Guard against NaN/inf propagation
+    if !(new_speed >= 0.0 && new_speed <= 200.0) {
+        new_speed = 0.0;
+    }
     car_speed[car_idx] = new_speed;
 
     // Advance position
     if is_left {
         let mut new_s = s - new_speed * pc.dt;
-        while new_s < 0.0 {
+        if new_s < 0.0 {
             new_s += road_len;
+        }
+        if !(new_s >= 0.0 && new_s < road_len) {
+            new_s = 0.0;
         }
         car_s[car_idx] = new_s;
     } else {
         let mut new_s = s + new_speed * pc.dt;
-        while new_s >= road_len {
+        if new_s >= road_len {
             new_s -= road_len;
+        }
+        if !(new_s >= 0.0 && new_s < road_len) {
+            new_s = 0.0;
         }
         car_s[car_idx] = new_s;
     }

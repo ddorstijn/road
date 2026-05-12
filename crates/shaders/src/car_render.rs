@@ -1,7 +1,7 @@
-use glam::{Mat4, Vec2, Vec3, Vec4};
-use gpu_shared::{GpuLane, GpuLaneSection, GpuRoad, GpuSegment};
 use crate::road_eval::{eval_segment, segment_local_to_world, PoseResult};
+use gpu_shared::{GpuLane, GpuLaneSection, GpuRoad, GpuSegment};
 use spirv_std::arch::Derivative;
+use spirv_std::glam::{Mat4, Vec2, Vec3, Vec4};
 use spirv_std::num_traits::Float;
 use spirv_std::spirv;
 
@@ -40,7 +40,13 @@ fn evaluate_road_at_s(
     }
 
     let seg = segments[seg_idx as usize];
-    let pose = eval_segment(seg.segment_type, local_s, seg.k_start, seg.k_end, seg.length);
+    let pose = eval_segment(
+        seg.segment_type,
+        local_s,
+        seg.k_start,
+        seg.k_end,
+        seg.length,
+    );
 
     let origin = Vec2::new(seg.origin[0], seg.origin[1]);
     PoseResult {
@@ -218,7 +224,11 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 
 #[inline]
 fn step(edge: f32, x: f32) -> f32 {
-    if x < edge { 0.0 } else { 1.0 }
+    if x < edge {
+        0.0
+    } else {
+        1.0
+    }
 }
 
 #[inline]

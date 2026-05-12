@@ -1,7 +1,7 @@
 //! Road evaluation functions shared between GPU shaders and CPU code.
 //! Replicates the math from crates/road/src/primitives.rs.
 
-use glam::Vec2;
+use spirv_std::glam::Vec2;
 use spirv_std::num_traits::Float;
 
 #[repr(C)]
@@ -88,7 +88,13 @@ pub fn heading_spiral(s: f32, k_start: f32, k_end: f32, total_length: f32) -> f3
 // Evaluate a segment at local parameter s → (position, heading)
 // ---------------------------------------------------------------------------
 
-pub fn eval_segment(seg_type: u32, s: f32, k_start: f32, k_end: f32, seg_length: f32) -> PoseResult {
+pub fn eval_segment(
+    seg_type: u32,
+    s: f32,
+    k_start: f32,
+    k_end: f32,
+    seg_length: f32,
+) -> PoseResult {
     match seg_type {
         0 => PoseResult {
             position: eval_line(s),
@@ -109,7 +115,11 @@ pub fn eval_segment(seg_type: u32, s: f32, k_start: f32, k_end: f32, seg_length:
 pub fn segment_local_to_world(local_pos: Vec2, origin: Vec2, heading: f32) -> Vec2 {
     let c = heading.cos();
     let s = heading.sin();
-    origin + Vec2::new(c * local_pos.x - s * local_pos.y, s * local_pos.x + c * local_pos.y)
+    origin
+        + Vec2::new(
+            c * local_pos.x - s * local_pos.y,
+            s * local_pos.x + c * local_pos.y,
+        )
 }
 
 /// Transform from world coordinates to segment-local coordinates.
@@ -161,7 +171,12 @@ pub fn closest_point_arc(point: Vec2, seg_length: f32, curvature: f32) -> Closes
     ClosestResult { s, signed_dist }
 }
 
-pub fn closest_point_spiral(point: Vec2, seg_length: f32, k_start: f32, k_end: f32) -> ClosestResult {
+pub fn closest_point_spiral(
+    point: Vec2,
+    seg_length: f32,
+    k_start: f32,
+    k_end: f32,
+) -> ClosestResult {
     let dk = if seg_length > 1e-9 {
         (k_end - k_start) / seg_length
     } else {

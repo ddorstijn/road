@@ -8,6 +8,4 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 spirv-std = "0.10.0-alpha.1"
-glam = { version = "0.32", default-features = false, features = ["libm"] }
-libm = "0.2"
 gpu-shared = { path = "../gpu-shared", default-features = false, features = [] }

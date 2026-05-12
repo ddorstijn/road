@@ -88,9 +88,7 @@ dependencies = [
 name = "shaders"
 version = "0.1.0"
 dependencies = [
- "glam",
  "gpu-shared",
- "libm",
  "spirv-std",
 ]
 

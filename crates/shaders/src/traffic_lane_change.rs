@@ -1,4 +1,4 @@
-use glam::{UVec2, UVec3, Vec3};
+use spirv_std::glam::{UVec2, UVec3, Vec3};
 use spirv_std::num_traits::Float;
 use spirv_std::spirv;
 
@@ -37,7 +37,13 @@ fn forward_gap(s: f32, other_s: f32, road_len: f32, car_length: f32) -> f32 {
     g - car_length
 }
 
-fn directional_leader_gap(my_s: f32, other_s: f32, road_len: f32, is_left: bool, car_length: f32) -> f32 {
+fn directional_leader_gap(
+    my_s: f32,
+    other_s: f32,
+    road_len: f32,
+    is_left: bool,
+    car_length: f32,
+) -> f32 {
     if is_left {
         forward_gap(other_s, my_s, road_len, car_length)
     } else {
@@ -45,7 +51,13 @@ fn directional_leader_gap(my_s: f32, other_s: f32, road_len: f32, is_left: bool,
     }
 }
 
-fn directional_follower_gap(my_s: f32, other_s: f32, road_len: f32, is_left: bool, car_length: f32) -> f32 {
+fn directional_follower_gap(
+    my_s: f32,
+    other_s: f32,
+    road_len: f32,
+    is_left: bool,
+    car_length: f32,
+) -> f32 {
     if is_left {
         forward_gap(my_s, other_s, road_len, car_length)
     } else {
@@ -71,7 +83,7 @@ fn find_leader_in_lane(
     let mut best_gap = 1000.0f32;
     let mut best_speed = 0.0f32;
     let mut best_desired = 0.0f32;
-    let max_scan = 512u32;
+    let max_scan = 4u32;
     let is_left = target_lane < 0;
 
     // Search FORWARD
@@ -104,31 +116,31 @@ fn find_leader_in_lane(
         scan = sorted_idx - 1;
         count = 0;
         passed_target = false;
-        loop {
+        let mut running = true;
+        while running && count < max_scan {
             let idx = sorted_indices[scan as usize] as usize;
             if car_road_id[idx] != road_id {
-                break;
-            }
-            let l = car_lane[idx];
-            if l == target_lane {
-                passed_target = true;
-                let g = directional_leader_gap(s, car_s[idx], road_len, is_left, pc.car_length);
-                if g >= 0.0 && g < best_gap {
-                    best_gap = g;
-                    best_speed = car_speed[idx];
-                    best_desired = car_desired_speed[idx];
+                running = false;
+            } else {
+                let l = car_lane[idx];
+                if l == target_lane {
+                    passed_target = true;
+                    let g = directional_leader_gap(s, car_s[idx], road_len, is_left, pc.car_length);
+                    if g >= 0.0 && g < best_gap {
+                        best_gap = g;
+                        best_speed = car_speed[idx];
+                        best_desired = car_desired_speed[idx];
+                    }
+                } else if passed_target {
+                    running = false;
                 }
-            } else if passed_target {
-                break;
+                if scan == 0 {
+                    running = false;
+                } else {
+                    scan -= 1;
+                }
+                count += 1;
             }
-            if scan == 0 {
-                break;
-            }
-            count += 1;
-            if count >= max_scan {
-                break;
-            }
-            scan -= 1;
         }
     }
 
@@ -153,7 +165,7 @@ fn find_follower_in_lane(
     let mut best_gap = 1000.0f32;
     let mut best_speed = 0.0f32;
     let mut best_desired = 0.0f32;
-    let max_scan = 512u32;
+    let max_scan = 4u32;
     let is_left = target_lane < 0;
 
     // Search FORWARD
@@ -186,31 +198,31 @@ fn find_follower_in_lane(
         scan = sorted_idx - 1;
         count = 0;
         passed_target = false;
-        loop {
+        let mut running = true;
+        while running && count < max_scan {
             let idx = sorted_indices[scan as usize] as usize;
             if car_road_id[idx] != road_id {
-                break;
-            }
-            let l = car_lane[idx];
-            if l == target_lane {
-                passed_target = true;
-                let g = directional_follower_gap(s, car_s[idx], road_len, is_left, pc.car_length);
-                if g >= 0.0 && g < best_gap {
-                    best_gap = g;
-                    best_speed = car_speed[idx];
-                    best_desired = car_desired_speed[idx];
+                running = false;
+            } else {
+                let l = car_lane[idx];
+                if l == target_lane {
+                    passed_target = true;
+                    let g = directional_follower_gap(s, car_s[idx], road_len, is_left, pc.car_length);
+                    if g >= 0.0 && g < best_gap {
+                        best_gap = g;
+                        best_speed = car_speed[idx];
+                        best_desired = car_desired_speed[idx];
+                    }
+                } else if passed_target {
+                    running = false;
                 }
-            } else if passed_target {
-                break;
+                if scan == 0 {
+                    running = false;
+                } else {
+                    scan -= 1;
+                }
+                count += 1;
             }
-            if scan == 0 {
-                break;
-            }
-            count += 1;
-            if count >= max_scan {
-                break;
-            }
-            scan -= 1;
         }
     }
 
@@ -255,8 +267,18 @@ pub fn traffic_lane_change_main(
 
     // Find current lane acceleration
     let cur_leader = find_leader_in_lane(
-        road_id, lane, s, road_len, sorted_idx, pc,
-        car_road_id, car_s, car_lane, car_speed, car_desired_speed, sorted_indices,
+        road_id,
+        lane,
+        s,
+        road_len,
+        sorted_idx,
+        pc,
+        car_road_id,
+        car_s,
+        car_lane,
+        car_speed,
+        car_desired_speed,
+        sorted_indices,
     );
     let a_current = idm_accel(pc, speed, desired_speed, speed - cur_leader.y, cur_leader.x);
 
@@ -295,8 +317,18 @@ pub fn traffic_lane_change_main(
 
         // Find leader in target lane
         let tgt_leader = find_leader_in_lane(
-            road_id, target_lane, s, road_len, sorted_idx, pc,
-            car_road_id, car_s, car_lane, car_speed, car_desired_speed, sorted_indices,
+            road_id,
+            target_lane,
+            s,
+            road_len,
+            sorted_idx,
+            pc,
+            car_road_id,
+            car_s,
+            car_lane,
+            car_speed,
+            car_desired_speed,
+            sorted_indices,
         );
         if tgt_leader.x < min_gap {
             dir += 2;
@@ -306,22 +338,33 @@ pub fn traffic_lane_change_main(
 
         // Find follower in target lane
         let tgt_follower = find_follower_in_lane(
-            road_id, target_lane, s, road_len, sorted_idx, pc,
-            car_road_id, car_s, car_lane, car_speed, car_desired_speed, sorted_indices,
+            road_id,
+            target_lane,
+            s,
+            road_len,
+            sorted_idx,
+            pc,
+            car_road_id,
+            car_s,
+            car_lane,
+            car_speed,
+            car_desired_speed,
+            sorted_indices,
         );
         let follower_speed = tgt_follower.y;
         let follower_desired = tgt_follower.z;
         let follower_gap = tgt_follower.x;
 
-        if follower_gap < min_gap {
-            dir += 2;
-            continue;
-        }
-
         let is_rightward = (lane >= 0 && target_lane > lane) || (lane < 0 && target_lane < lane);
 
-        // When returning right, require extra clearance
-        if is_rightward && follower_gap < speed * pc.time_headway * 2.0 {
+        // Follower clearance: relaxed for rightward returns (follower is behind
+        // and slower), stricter for leftward overtakes (don't cut off faster car)
+        let follower_clearance = if is_rightward {
+            pc.car_length * 3.0
+        } else {
+            min_gap
+        };
+        if follower_gap < follower_clearance {
             dir += 2;
             continue;
         }
@@ -337,20 +380,30 @@ pub fn traffic_lane_change_main(
         let mut a_follower_new = 0.0f32;
         let mut a_follower_old = 0.0f32;
         if follower_gap < 999.0 {
-            a_follower_new = idm_accel(pc, follower_speed, follower_desired, follower_speed - speed, follower_gap);
+            a_follower_new = idm_accel(
+                pc,
+                follower_speed,
+                follower_desired,
+                follower_speed - speed,
+                follower_gap,
+            );
             if a_follower_new < -pc.b_safe {
                 dir += 2;
                 continue;
             }
             let follower_leader_gap = tgt_leader.x + follower_gap + pc.car_length;
             a_follower_old = idm_accel(
-                pc, follower_speed, follower_desired,
-                follower_speed - tgt_leader.y, follower_leader_gap,
+                pc,
+                follower_speed,
+                follower_desired,
+                follower_speed - tgt_leader.y,
+                follower_leader_gap,
             );
         }
 
         // MOBIL incentive criterion
-        let mut incentive = (a_target - a_current) + pc.politeness * (a_follower_new - a_follower_old);
+        let mut incentive =
+            (a_target - a_current) + pc.politeness * (a_follower_new - a_follower_old);
         let mut effective_threshold = pc.threshold;
 
         if is_rightward {

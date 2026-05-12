@@ -1,4 +1,4 @@
-use glam::{Mat4, UVec3, Vec2, Vec3, Vec4};
+use spirv_std::glam::{Mat4, UVec2, UVec3, Vec2, Vec3, Vec4};
 use spirv_std::image::StorageImage2d;
 use spirv_std::num_traits::Float;
 use spirv_std::spirv;
@@ -19,7 +19,7 @@ pub fn grid_main(
     #[spirv(push_constant)] camera: &CameraParams,
     #[spirv(descriptor_set = 0, binding = 0)] output: &StorageImage2d,
 ) {
-    let size = glam::UVec2::new(camera.width, camera.height);
+    let size = UVec2::new(camera.width, camera.height);
     if id.x >= size.x || id.y >= size.y {
         return;
     }

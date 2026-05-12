@@ -1,5 +1,5 @@
-use glam::{Mat4, Vec2, Vec3, Vec4};
 use gpu_shared::{GpuLane, GpuLaneSection, GpuRoad};
+use spirv_std::glam::{Mat4, Vec2, Vec3, Vec4};
 use spirv_std::image::Image2d;
 use spirv_std::spirv;
 use spirv_std::Sampler;
@@ -53,7 +53,8 @@ pub fn fs_main(
     #[spirv(descriptor_set = 0, binding = 0)] sdf_tex: &Image2d,
     #[spirv(descriptor_set = 0, binding = 1)] sdf_sampler: &Sampler,
     #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] roads: &[GpuRoad],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] lane_sections_buf: &[GpuLaneSection],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)]
+    lane_sections_buf: &[GpuLaneSection],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] lanes_buf: &[GpuLane],
     output: &mut Vec4,
 ) {
@@ -89,7 +90,10 @@ pub fn fs_main(
     let on_left = signed_dist >= 0.0;
 
     let (lane_start, lane_end) = if on_left {
-        (section.lane_offset, section.lane_offset + section.left_lane_count)
+        (
+            section.lane_offset,
+            section.lane_offset + section.left_lane_count,
+        )
     } else {
         (
             section.lane_offset + section.left_lane_count,

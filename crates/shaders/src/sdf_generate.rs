@@ -1,6 +1,6 @@
-use glam::{UVec3, Vec2, Vec4};
-use gpu_shared::{GpuSegment, TileHeader};
 use crate::road_eval::{closest_point_on_segment, world_to_segment_local};
+use gpu_shared::{GpuSegment, TileHeader};
+use spirv_std::glam::{IVec2, UVec3, Vec2, Vec4};
 use spirv_std::image::StorageImage2d;
 use spirv_std::spirv;
 
@@ -52,7 +52,13 @@ pub fn sdf_generate_main(
         let origin = Vec2::new(seg.origin[0], seg.origin[1]);
         let local_pt = world_to_segment_local(world_pos, origin, seg.heading);
 
-        let cp = closest_point_on_segment(seg.segment_type, local_pt, seg.length, seg.k_start, seg.k_end);
+        let cp = closest_point_on_segment(
+            seg.segment_type,
+            local_pt,
+            seg.length,
+            seg.k_start,
+            seg.k_end,
+        );
 
         let abs_dist = cp.signed_dist.abs();
         if abs_dist < min_dist {
@@ -65,12 +71,15 @@ pub fn sdf_generate_main(
     }
 
     let s_mod = best_s % 6.0;
-    let atlas_pos = glam::IVec2::new(
+    let atlas_pos = IVec2::new(
         (pc.atlas_offset_x + id.x) as i32,
         (pc.atlas_offset_y + id.y) as i32,
     );
 
     unsafe {
-        sdf_atlas.write(atlas_pos, Vec4::new(best_signed_dist, best_s, best_road, s_mod));
+        sdf_atlas.write(
+            atlas_pos,
+            Vec4::new(best_signed_dist, best_s, best_road, s_mod),
+        );
     }
 }
