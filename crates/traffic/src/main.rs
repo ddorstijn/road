@@ -873,11 +873,9 @@ impl TrafficApp {
             self.traffic.dispatch_sort(device, cmd);
 
             // IDM car-following
-            #[cfg(feature = "idm")]
             self.traffic.dispatch_idm(device, cmd);
 
             // MOBIL lane change
-            #[cfg(feature = "mobil")]
             if self.traffic.should_lane_change() {
                 self.traffic.dispatch_lane_change(device, cmd);
             }

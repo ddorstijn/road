@@ -26,7 +26,6 @@ const SORT_TILE_SIZE: u32 = 256;
 const NUM_SORT_WG: u32 = MAX_CARS / SORT_TILE_SIZE; // 2048
 
 /// MOBIL lane change frequency (every N simulation ticks)
-#[cfg(feature = "mobil")]
 const LANE_CHANGE_INTERVAL: u32 = 30;
 
 // ---------------------------------------------------------------------------
@@ -34,19 +33,14 @@ const LANE_CHANGE_INTERVAL: u32 = 30;
 // ---------------------------------------------------------------------------
 
 /// Maximum acceleration (m/s²)
-#[cfg(any(feature = "idm", feature = "mobil"))]
 const IDM_A_MAX: f32 = 1.5;
 /// Comfortable braking deceleration (m/s²)
-#[cfg(any(feature = "idm", feature = "mobil"))]
 const IDM_B_COMFORT: f32 = 2.0;
 /// Minimum gap distance (m)
-#[cfg(any(feature = "idm", feature = "mobil"))]
 const IDM_S0: f32 = 2.0;
 /// Desired time headway (s)
-#[cfg(any(feature = "idm", feature = "mobil"))]
 const IDM_TIME_HEADWAY: f32 = 1.5;
 /// Car length (m)
-#[cfg(any(feature = "idm", feature = "mobil"))]
 const CAR_LENGTH: f32 = 4.5;
 
 // ---------------------------------------------------------------------------
@@ -54,16 +48,12 @@ const CAR_LENGTH: f32 = 4.5;
 // ---------------------------------------------------------------------------
 
 /// Politeness factor
-#[cfg(feature = "mobil")]
 const MOBIL_POLITENESS: f32 = 0.3;
 /// Lane change incentive threshold (for overtaking / leftward moves)
-#[cfg(feature = "mobil")]
 const MOBIL_THRESHOLD: f32 = 0.2;
 /// Maximum safe braking for follower (m/s²)
-#[cfg(feature = "mobil")]
 const MOBIL_B_SAFE: f32 = 4.0;
 /// Keep-right bias: added incentive for returning to the rightmost lane (m/s²)
-#[cfg(feature = "mobil")]
 const MOBIL_KEEP_RIGHT_BIAS: f32 = 0.3;
 
 // ---------------------------------------------------------------------------
@@ -106,7 +96,6 @@ struct SortScatterPushConstants {
     _pad: u32,
 }
 
-#[cfg(feature = "idm")]
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct IdmPushConstants {
@@ -120,7 +109,6 @@ struct IdmPushConstants {
     _pad: u32,
 }
 
-#[cfg(feature = "mobil")]
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MobilPushConstants {
@@ -163,9 +151,7 @@ pub struct TrafficSim {
     sort_histogram_pass: Option<ComputePass>,
     sort_scan_pass: Option<ComputePass>,
     sort_scatter_pass: Option<ComputePass>,
-    #[cfg(feature = "idm")]
     idm_pass: Option<ComputePass>,
-    #[cfg(feature = "mobil")]
     mobil_pass: Option<ComputePass>,
 
     // Car renderer (instanced rendering)
@@ -198,9 +184,7 @@ impl Default for TrafficSim {
             sort_histogram_pass: None,
             sort_scan_pass: None,
             sort_scatter_pass: None,
-            #[cfg(feature = "idm")]
             idm_pass: None,
-            #[cfg(feature = "mobil")]
             mobil_pass: None,
 
             car_renderer: None,
@@ -264,30 +248,24 @@ impl TrafficSim {
         )?);
 
         // IDM car-following (7 SSBOs)
-        #[cfg(feature = "idm")]
-        {
-            self.idm_pass = Some(ComputePass::new(
-                device,
-                &spirv,
-                "traffic_idm::traffic_idm_main",
-                7,
-                std::mem::size_of::<IdmPushConstants>() as u32,
-                1,
-            )?);
-        }
+        self.idm_pass = Some(ComputePass::new(
+            device,
+            &spirv,
+            "traffic_idm::traffic_idm_main",
+            7,
+            std::mem::size_of::<IdmPushConstants>() as u32,
+            1,
+        )?);
 
         // MOBIL lane change (8 SSBOs: car SoA + road_lengths + sorted_indices + road_lane_counts)
-        #[cfg(feature = "mobil")]
-        {
-            self.mobil_pass = Some(ComputePass::new(
-                device,
-                &spirv,
-                "traffic_lane_change::traffic_lane_change_main",
-                8,
-                std::mem::size_of::<MobilPushConstants>() as u32,
-                1,
-            )?);
-        }
+        self.mobil_pass = Some(ComputePass::new(
+            device,
+            &spirv,
+            "traffic_lane_change::traffic_lane_change_main",
+            8,
+            std::mem::size_of::<MobilPushConstants>() as u32,
+            1,
+        )?);
 
         Ok(())
     }
@@ -493,8 +471,7 @@ impl TrafficSim {
         road_buffer: Option<&GpuBuffer>,
         lane_section_buffer: Option<&GpuBuffer>,
         lane_buffer: Option<&GpuBuffer>,
-        #[cfg(feature = "mobil")] road_lane_counts_buf: Option<&GpuBuffer>,
-        #[cfg(not(feature = "mobil"))] _road_lane_counts_buf: Option<&GpuBuffer>,
+        road_lane_counts_buf: Option<&GpuBuffer>,
     ) {
         if !self.initialized {
             return;
@@ -616,7 +593,6 @@ impl TrafficSim {
 
         // IDM: bindings 0-6 = car SoA + road_lengths + sorted_indices
         // After 4 sort passes: final sorted indices are in vals_a
-        #[cfg(feature = "idm")]
         if let Some(pass) = &self.idm_pass {
             write_storage_buffers(
                 device,
@@ -635,7 +611,6 @@ impl TrafficSim {
         }
 
         // MOBIL: bindings 0-7 = car SoA + road_lengths + sorted_indices + road_lane_counts
-        #[cfg(feature = "mobil")]
         if let Some(pass) = &self.mobil_pass
             && let Some(lane_counts) = road_lane_counts_buf
         {
@@ -826,7 +801,6 @@ impl TrafficSim {
     }
 
     /// Record GPU commands for IDM car-following dynamics.
-    #[cfg(feature = "idm")]
     pub fn dispatch_idm(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
         let car_count = self.car_count;
         let idm_pass = match &self.idm_pass {
@@ -874,7 +848,6 @@ impl TrafficSim {
     }
 
     /// Record GPU commands for MOBIL lane change evaluation.
-    #[cfg(feature = "mobil")]
     pub fn dispatch_lane_change(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
         let mobil_pass = match &self.mobil_pass {
             Some(p) => p,
@@ -949,7 +922,6 @@ impl TrafficSim {
     }
 
     /// Whether a MOBIL lane change should run this tick.
-    #[cfg(feature = "mobil")]
     pub fn should_lane_change(&self) -> bool {
         self.sim_tick.is_multiple_of(LANE_CHANGE_INTERVAL)
     }
@@ -980,18 +952,12 @@ impl TrafficSim {
             &mut self.sort_histogram_pass,
             &mut self.sort_scan_pass,
             &mut self.sort_scatter_pass,
+            &mut self.idm_pass,
+            &mut self.mobil_pass,
         ] {
             if let Some(p) = pass.take() {
                 p.destroy(device);
             }
-        }
-        #[cfg(feature = "idm")]
-        if let Some(p) = self.idm_pass.take() {
-            p.destroy(device);
-        }
-        #[cfg(feature = "mobil")]
-        if let Some(p) = self.mobil_pass.take() {
-            p.destroy(device);
         }
         if let Some(renderer) = self.car_renderer.take() {
             renderer.destroy(device);
