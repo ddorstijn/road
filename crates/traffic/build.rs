@@ -1,7 +1,7 @@
 use spirv_builder::{Capability, SpirvBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut builder = SpirvBuilder::new("../shaders", "spirv-unknown-vulkan1.3")
+    let mut builder = SpirvBuilder::new("../shaders", "spirv-unknown-vulkan1.4")
         .capability(Capability::StorageImageWriteWithoutFormat)
         .capability(Capability::ImageQuery)
         .capability(Capability::VulkanMemoryModelDeviceScope);

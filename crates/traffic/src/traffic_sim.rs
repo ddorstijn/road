@@ -377,6 +377,7 @@ impl TrafficSim {
         self.sort_histogram_buf = Some(hist_buf);
 
         self.sim_tick = 0;
+        self.sim_accumulator = 0.0;
         self.initialized = true;
         Ok(())
     }
@@ -457,6 +458,7 @@ impl TrafficSim {
         self.sort_histogram_buf = Some(hist_buf);
 
         self.sim_tick = 0;
+        self.sim_accumulator = 0.0;
         self.initialized = true;
         Ok(())
     }

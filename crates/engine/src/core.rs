@@ -2,9 +2,9 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vulkanalia::Version;
 use vulkanalia::prelude::v1_4::*;
 use vulkanalia::vk::KhrSwapchainExtensionDeviceCommands;
+use vulkanalia::Version;
 use vulkanalia_bootstrap::{
     Device, DeviceBuilder, Instance, InstanceBuilder, PhysicalDeviceSelector, PreferredDeviceType,
     QueueType, Swapchain, SwapchainBuilder,
@@ -75,7 +75,8 @@ impl Core {
             .dynamic_rendering(true);
 
         let base_features = vk::PhysicalDeviceFeatures::builder()
-            .pipeline_statistics_query(true);
+            .pipeline_statistics_query(true)
+            .robust_buffer_access(true);
 
         let physical_device = PhysicalDeviceSelector::new(instance.clone())
             .preferred_device_type(PreferredDeviceType::Discrete)

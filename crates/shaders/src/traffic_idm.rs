@@ -138,13 +138,13 @@ pub fn traffic_idm_main(
     // Advance position
     if is_left {
         let mut new_s = s - new_speed * pc.dt;
-        if new_s < 0.0 {
+        while new_s < 0.0 {
             new_s += road_len;
         }
         car_s[car_idx] = new_s;
     } else {
         let mut new_s = s + new_speed * pc.dt;
-        if new_s >= road_len {
+        while new_s >= road_len {
             new_s -= road_len;
         }
         car_s[car_idx] = new_s;
