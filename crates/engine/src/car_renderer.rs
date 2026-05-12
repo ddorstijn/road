@@ -1,8 +1,11 @@
-//! Car renderer — instanced rendering of cars as oriented rectangles.
+//! Car renderer — indirect instanced rendering of cars as oriented rectangles.
 //!
-//! Reads car SoA SSBOs + road data SSBOs, evaluates road position in the vertex shader,
-//! and renders each car as a 6-vertex quad (2 triangles) with speed-based coloring,
-//! outline, and windshield indicator.
+//! Reads car SoA SSBOs + road data SSBOs + a visibility index buffer, evaluates
+//! road position in the vertex shader, and renders each visible car as a 6-vertex
+//! quad (2 triangles) with speed-based coloring, outline, and windshield indicator.
+//!
+//! Drawing is done via `cmd_draw_indirect` — the indirect draw command buffer and
+//! visible index buffer are produced by the frustum cull compute pass.
 
 use vulkanalia::prelude::v1_4::*;
 use vulkanalia_bootstrap::Device;
@@ -49,8 +52,8 @@ impl CarRenderer {
         color_attachment_format: vk::Format,
         spirv: &[u32],
     ) -> anyhow::Result<Self> {
-        // 9 storage buffer bindings: 0-4 car SoA, 5-8 road data
-        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..9)
+        // 10 storage buffer bindings: 0-4 car SoA, 5-8 road data, 9 visible_indices
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..10)
             .map(|i| {
                 vk::DescriptorSetLayoutBinding::builder()
                     .binding(i)
@@ -65,7 +68,7 @@ impl CarRenderer {
 
         let pool_sizes = [vk::DescriptorPoolSize::builder()
             .type_(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(9)
+            .descriptor_count(10)
             .build()];
         let pool_info = vk::DescriptorPoolCreateInfo::builder()
             .max_sets(1)
@@ -107,10 +110,11 @@ impl CarRenderer {
         })
     }
 
-    /// Update descriptor set with current car + road buffers.
+    /// Update descriptor set with current car + road + visibility buffers.
     ///
     /// Car buffers (bindings 0-4): road_id, s, lane, speed, desired_speed
     /// Road buffers (bindings 5-8): segments, roads, lane_sections, lanes
+    /// Visibility buffer (binding 9): visible_indices (from frustum cull pass)
     pub fn update_descriptors(
         &mut self,
         device: &Device,
@@ -123,8 +127,9 @@ impl CarRenderer {
         road_buf: &GpuBuffer,
         lane_section_buf: &GpuBuffer,
         lane_buf: &GpuBuffer,
+        visible_indices_buf: &GpuBuffer,
     ) {
-        let bufs: [&GpuBuffer; 9] = [
+        let bufs: [&GpuBuffer; 10] = [
             car_road_id,
             car_s,
             car_lane,
@@ -134,6 +139,7 @@ impl CarRenderer {
             road_buf,
             lane_section_buf,
             lane_buf,
+            visible_indices_buf,
         ];
 
         let buf_infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
@@ -173,11 +179,19 @@ impl CarRenderer {
         self.descriptors_valid
     }
 
-    /// Record draw commands for all cars.
+    /// Record indirect draw commands for all visible cars.
     ///
+    /// Uses `cmd_draw_indirect` to read vertex_count and instance_count from
+    /// the indirect draw command buffer produced by the frustum cull pass.
     /// The caller must have already begun dynamic rendering on the command buffer.
-    pub fn draw(&self, device: &Device, cmd: vk::CommandBuffer, pc: &CarRenderPushConstants) {
-        if !self.descriptors_valid || pc.car_count == 0 {
+    pub fn draw_indirect(
+        &self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        pc: &CarRenderPushConstants,
+        indirect_buffer: vk::Buffer,
+    ) {
+        if !self.descriptors_valid {
             return;
         }
 
@@ -201,7 +215,7 @@ impl CarRenderer {
                 bytemuck::bytes_of(pc),
             );
 
-            device.cmd_draw(cmd, 6, pc.car_count, 0, 0);
+            device.cmd_draw_indirect(cmd, indirect_buffer, 0, 1, 0);
         }
     }
 

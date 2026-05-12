@@ -4,14 +4,13 @@ mod traffic_sim;
 
 use std::path::PathBuf;
 
+use engine::frustum_cull::{camera_world_bounds, CarCullPass, TileCullPass};
 use engine::gpu_resources::GpuBuffer;
 use engine::pipeline::{
     GraphicsPipelineDesc, allocate_descriptor_set, create_compute_pipeline,
     create_descriptor_set_layout, create_graphics_pipeline, write_storage_buffers,
 };
-use engine::sdf::{
-    ATLAS_TILES, RoadSegmentInfo, SdfTileManager, TILE_RESOLUTION, TILE_SIZE, compute_segment_aabbs,
-};
+use engine::sdf::{RoadSegmentInfo, SdfTileManager, compute_segment_aabbs};
 use engine::vk::{DeviceV1_0, DeviceV1_3, Handle, HasBuilder};
 use engine::{App, EngineContext, transition_image, vk};
 use glam::Vec2;
@@ -59,10 +58,6 @@ struct LinePushConstants {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RoadRenderPushConstants {
     view_proj: [[f32; 4]; 4],
-    atlas_uv_offset: [f32; 2],
-    atlas_uv_scale: [f32; 2],
-    tile_world_origin: [f32; 2],
-    tile_world_size: [f32; 2],
 }
 
 #[repr(C)]
@@ -124,6 +119,10 @@ struct TrafficApp {
     // Traffic simulation
     traffic: TrafficSim,
 
+    // Frustum culling passes
+    car_cull: Option<CarCullPass>,
+    tile_cull: Option<TileCullPass>,
+
     // Scenario-based car placement (overrides random init when Some)
     scenario_cars: Option<Vec<scenario::ScenarioCar>>,
 
@@ -172,6 +171,9 @@ impl Default for TrafficApp {
             road_render_descriptors_valid: false,
 
             traffic: TrafficSim::default(),
+
+            car_cull: None,
+            tile_cull: None,
 
             scenario_cars: None,
 
@@ -337,6 +339,13 @@ impl TrafficApp {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT)
                 .build(),
+            // binding 5: tile instance buffer (visible tiles from cull pass)
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX)
+                .build(),
         ];
         self.road_render_descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
 
@@ -351,7 +360,7 @@ impl TrafficApp {
                 .build(),
             vk::DescriptorPoolSize::builder()
                 .type_(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(3)
+                .descriptor_count(4) // bindings 2-5
                 .build(),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::builder()
@@ -395,7 +404,7 @@ impl TrafficApp {
         }
 
         let push_constant_ranges = [vk::PushConstantRange::builder()
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
             .size(std::mem::size_of::<RoadRenderPushConstants>() as u32)
             .build()];
@@ -471,11 +480,19 @@ impl TrafficApp {
             }
         };
 
+        let visible_tiles_buf = match &self.tile_cull {
+            Some(tc) => &tc.visible_tiles_buf,
+            None => {
+                self.road_render_descriptors_valid = false;
+                return;
+            }
+        };
+
         write_storage_buffers(
             ctx.device.as_ref(),
             self.road_render_descriptor_set,
             2,
-            &[road_buf, ls_buf, lane_buf],
+            &[road_buf, ls_buf, lane_buf, visible_tiles_buf],
         );
         self.road_render_descriptors_valid = true;
     }
@@ -542,6 +559,23 @@ impl TrafficApp {
 
         self.gpu_road_data.upload(ctx.allocator, &self.network)?;
         self.rebuild_sdf_tiles(ctx)?;
+
+        // Upload tile instances for frustum culling
+        if let Some(sdf) = &self.sdf_manager {
+            if self.tile_cull.is_none() {
+                let spirv = spirv_bytes_to_words(GRID_SPIRV);
+                // Initial allocation sized to atlas capacity; reallocates if needed
+                let atlas_capacity = sdf.atlas_tiles_dim * sdf.atlas_tiles_dim;
+                self.tile_cull = Some(TileCullPass::new(
+                    ctx.device.as_ref(),
+                    ctx.allocator,
+                    &spirv,
+                    atlas_capacity.max(1),
+                )?);
+            }
+            // Tile instances will be uploaded by stream_visible_tiles() in the render loop
+        }
+
         self.update_road_render_descriptors(ctx);
 
         if let Some(cars) = &self.scenario_cars {
@@ -568,6 +602,48 @@ impl TrafficApp {
             self.traffic
                 .initialize_cars(ctx.allocator, &self.network, cars_per_road)?;
         }
+
+        // Create car cull pass if needed
+        if self.car_cull.is_none() {
+            let spirv = spirv_bytes_to_words(GRID_SPIRV);
+            self.car_cull = Some(CarCullPass::new(
+                ctx.device.as_ref(),
+                ctx.allocator,
+                &spirv,
+                crate::traffic_sim::MAX_CARS,
+            )?);
+        }
+
+        // Update car cull descriptors
+        if let (
+            Some(car_cull),
+            Some((car_road_id, car_s, car_lane)),
+            Some(seg_buf),
+            Some(rd_buf),
+            Some(ls_buf),
+            Some(ln_buf),
+        ) = (
+            &mut self.car_cull,
+            self.traffic.car_buffers(),
+            self.gpu_road_data.segment_buffer.as_ref(),
+            self.gpu_road_data.road_buffer.as_ref(),
+            self.gpu_road_data.lane_section_buffer.as_ref(),
+            self.gpu_road_data.lane_buffer.as_ref(),
+        ) {
+            car_cull.update_descriptors(
+                ctx.device.as_ref(),
+                car_road_id,
+                car_s,
+                car_lane,
+                seg_buf,
+                rd_buf,
+                ls_buf,
+                ln_buf,
+            );
+        }
+
+        // Update traffic sim descriptors (car renderer + sort passes)
+        let visible_indices_buf = self.car_cull.as_ref().map(|c| &c.visible_indices_buf);
         self.traffic.update_descriptors(
             ctx.device.as_ref(),
             self.gpu_road_data.segment_buffer.as_ref(),
@@ -575,6 +651,7 @@ impl TrafficApp {
             self.gpu_road_data.lane_section_buffer.as_ref(),
             self.gpu_road_data.lane_buffer.as_ref(),
             self.gpu_road_data.road_lane_counts_buf.as_ref(),
+            visible_indices_buf,
         );
 
         self.dirty = false;
@@ -781,6 +858,38 @@ impl TrafficApp {
 // ---------------------------------------------------------------------------
 
 impl TrafficApp {
+    /// Stream tiles into the atlas based on camera visibility.
+    /// Re-uploads tile instances and descriptors if the loaded set changed.
+    fn stream_visible_tiles(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
+        let sdf = match self.sdf_manager.as_mut() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let aspect = ctx.window_width as f32 / ctx.window_height.max(1) as f32;
+        let (min_x, min_y, max_x, max_y) = camera_world_bounds(ctx.camera, aspect);
+        sdf.update_visible(min_x, min_y, max_x, max_y);
+
+        if !sdf.tiles_changed {
+            return Ok(());
+        }
+        sdf.tiles_changed = false;
+
+        // Wait for GPU to finish using the old buffers/descriptors
+        unsafe { ctx.device.device_wait_idle()?; }
+
+        // Re-upload tile instances for the frustum cull pass
+        if let Some(tc) = &mut self.tile_cull {
+            let sdf = self.sdf_manager.as_ref().unwrap();
+            tc.upload_tile_instances(ctx.allocator, sdf)?;
+            tc.update_descriptors(ctx.device.as_ref());
+        }
+
+        self.update_road_render_descriptors(ctx);
+
+        Ok(())
+    }
+
     fn dispatch_sdf(&mut self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
         let sdf = match self.sdf_manager.as_mut() {
             Some(s) => s,
@@ -886,18 +995,42 @@ impl TrafficApp {
             self.traffic.sim_accumulator = 0.0;
         }
 
-        // Final barrier: compute writes → vertex shader reads
+        // Final barrier: compute writes → compute reads (cull pass) + vertex shader reads
         if ticks_this_frame > 0 {
             unsafe {
                 let barrier = vk::MemoryBarrier2::builder()
                     .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_SHADER)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags2::COMPUTE_SHADER
+                            | vk::PipelineStageFlags2::VERTEX_SHADER,
+                    )
                     .dst_access_mask(vk::AccessFlags2::SHADER_READ);
                 let dep =
                     vk::DependencyInfo::builder().memory_barriers(std::slice::from_ref(&barrier));
                 device.cmd_pipeline_barrier2(cmd, &dep);
             }
+        }
+    }
+
+    fn dispatch_frustum_cull(&self, ctx: &EngineContext, cmd: vk::CommandBuffer) {
+        let device = ctx.device.as_ref();
+        let aspect = ctx.window_width as f32 / ctx.window_height as f32;
+
+        // Car frustum cull
+        if let Some(car_cull) = &self.car_cull {
+            car_cull.dispatch(
+                device,
+                cmd,
+                self.traffic.car_count,
+                ctx.camera,
+                aspect,
+            );
+        }
+
+        // Tile frustum cull
+        if let Some(tile_cull) = &self.tile_cull {
+            tile_cull.dispatch(device, cmd, ctx.camera, aspect);
         }
     }
 
@@ -953,9 +1086,16 @@ impl TrafficApp {
             let aspect = ctx.window_width as f32 / ctx.window_height as f32;
             let vp = ctx.camera.view_projection(aspect);
 
-            self.draw_road_tiles(device, cmd, &vp);
+            self.draw_road_tiles_indirect(device, cmd, &vp);
             self.draw_polylines(device, cmd, &vp);
-            self.traffic.draw_cars(device, cmd, vp.to_cols_array_2d());
+
+            let car_indirect_buf = self
+                .car_cull
+                .as_ref()
+                .map(|c| c.draw_indirect_buf.buffer)
+                .unwrap_or(vk::Buffer::null());
+            self.traffic
+                .draw_cars(device, cmd, vp.to_cols_array_2d(), car_indirect_buf);
 
             device.cmd_end_rendering(cmd);
         }
@@ -969,14 +1109,19 @@ impl TrafficApp {
         );
     }
 
-    fn draw_road_tiles(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer, vp: &glam::Mat4) {
-        let sdf = match &self.sdf_manager {
-            Some(s) => s,
-            None => return,
-        };
-        if sdf.tile_map.tiles.is_empty() || !self.road_render_descriptors_valid {
+    fn draw_road_tiles_indirect(
+        &self,
+        device: &engine::VkDevice,
+        cmd: vk::CommandBuffer,
+        vp: &glam::Mat4,
+    ) {
+        if !self.road_render_descriptors_valid {
             return;
         }
+        let tile_cull = match &self.tile_cull {
+            Some(tc) if tc.tile_count > 0 => tc,
+            _ => return,
+        };
 
         unsafe {
             device.cmd_bind_pipeline(
@@ -992,39 +1137,19 @@ impl TrafficApp {
                 &[self.road_render_descriptor_set],
                 &[],
             );
-        }
-
-        let atlas_tiles = ATLAS_TILES;
-        let atlas_size_f = (atlas_tiles * TILE_RESOLUTION) as f32;
-        let half_texel = 0.5 / atlas_size_f;
-
-        for (key, info) in &sdf.tile_map.tiles {
-            let slot_x = info.atlas_slot % atlas_tiles;
-            let slot_y = info.atlas_slot / atlas_tiles;
-            let uv_offset_x = (slot_x * TILE_RESOLUTION) as f32 / atlas_size_f + half_texel;
-            let uv_offset_y = (slot_y * TILE_RESOLUTION) as f32 / atlas_size_f + half_texel;
-            let uv_scale = TILE_RESOLUTION as f32 / atlas_size_f - 2.0 * half_texel;
-
-            let (wx, wy) = key.world_origin();
 
             let pc = RoadRenderPushConstants {
                 view_proj: vp.to_cols_array_2d(),
-                atlas_uv_offset: [uv_offset_x, uv_offset_y],
-                atlas_uv_scale: [uv_scale, uv_scale],
-                tile_world_origin: [wx, wy],
-                tile_world_size: [TILE_SIZE, TILE_SIZE],
             };
+            device.cmd_push_constants(
+                cmd,
+                self.road_render_pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                bytemuck::bytes_of(&pc),
+            );
 
-            unsafe {
-                device.cmd_push_constants(
-                    cmd,
-                    self.road_render_pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    bytemuck::bytes_of(&pc),
-                );
-                device.cmd_draw(cmd, 6, 1, 0, 0);
-            }
+            device.cmd_draw_indirect(cmd, tile_cull.draw_indirect_buf.buffer, 0, 1, 0);
         }
     }
 
@@ -1151,6 +1276,9 @@ impl App for TrafficApp {
         }
         self.handle_dirty_roads(ctx)?;
 
+        // Phase: Stream tiles into atlas based on camera view
+        self.stream_visible_tiles(ctx)?;
+
         // Phase: SDF tile generation
         self.dispatch_sdf(device, cmd);
 
@@ -1159,6 +1287,9 @@ impl App for TrafficApp {
 
         // Phase: Traffic simulation (sort → IDM → MOBIL) — writes sub-phase timestamps internally
         self.dispatch_traffic(device, cmd, ctx.dt);
+
+        // Phase: Frustum culling (cars + tiles → indirect draw commands)
+        self.dispatch_frustum_cull(ctx, cmd);
 
         // Phase: Scene rendering (roads, polylines, cars)
         self.draw_scene(ctx, cmd);
@@ -1199,6 +1330,12 @@ impl App for TrafficApp {
         self.gpu_road_data.destroy(ctx.allocator);
         if let Some(mut sdf) = self.sdf_manager.take() {
             sdf.destroy(ctx.device.as_ref(), ctx.allocator);
+        }
+        if let Some(mut car_cull) = self.car_cull.take() {
+            car_cull.destroy(ctx.device.as_ref(), ctx.allocator);
+        }
+        if let Some(mut tile_cull) = self.tile_cull.take() {
+            tile_cull.destroy(ctx.device.as_ref(), ctx.allocator);
         }
         self.traffic.destroy(ctx.device.as_ref(), ctx.allocator);
         // Save and destroy Vulkan pipeline cache

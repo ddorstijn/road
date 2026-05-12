@@ -1,4 +1,4 @@
-use crate::road_eval::{eval_segment, segment_local_to_world, PoseResult};
+use crate::road_eval::{evaluate_road_at_s, compute_lane_offset};
 use gpu_shared::{GpuLane, GpuLaneSection, GpuRoad, GpuSegment};
 use spirv_std::arch::Derivative;
 use spirv_std::glam::{Mat4, Vec2, Vec3, Vec4};
@@ -18,95 +18,6 @@ pub struct PushConstants {
 const CAR_LENGTH: f32 = 4.5;
 const CAR_WIDTH: f32 = 2.0;
 
-fn evaluate_road_at_s(
-    road_id: u32,
-    s_global: f32,
-    roads: &[GpuRoad],
-    segments: &[GpuSegment],
-) -> PoseResult {
-    let road = roads[road_id as usize];
-    let mut seg_idx = road.segment_offset;
-    let mut local_s = s_global;
-
-    let mut i = 0u32;
-    while i < road.segment_count {
-        let seg = segments[(road.segment_offset + i) as usize];
-        if s_global < seg.s_start + seg.length || i == road.segment_count - 1 {
-            seg_idx = road.segment_offset + i;
-            local_s = (s_global - seg.s_start).clamp(0.0, seg.length);
-            break;
-        }
-        i += 1;
-    }
-
-    let seg = segments[seg_idx as usize];
-    let pose = eval_segment(
-        seg.segment_type,
-        local_s,
-        seg.k_start,
-        seg.k_end,
-        seg.length,
-    );
-
-    let origin = Vec2::new(seg.origin[0], seg.origin[1]);
-    PoseResult {
-        position: segment_local_to_world(pose.position, origin, seg.heading),
-        heading: seg.heading + pose.heading,
-    }
-}
-
-fn compute_lane_offset(
-    road_id: u32,
-    lane_idx: i32,
-    s_global: f32,
-    roads: &[GpuRoad],
-    lane_sections: &[GpuLaneSection],
-    lanes: &[GpuLane],
-) -> f32 {
-    let road = roads[road_id as usize];
-
-    let mut section_idx = road.lane_section_offset;
-    let mut i = 0u32;
-    while i < road.lane_section_count {
-        let ls = lane_sections[(road.lane_section_offset + i) as usize];
-        if s_global >= ls.s_start && s_global < ls.s_end {
-            section_idx = road.lane_section_offset + i;
-            break;
-        }
-        section_idx = road.lane_section_offset + i;
-        i += 1;
-    }
-
-    let section = lane_sections[section_idx as usize];
-    let left_count = section.left_lane_count as i32;
-    let mut offset = 0.0f32;
-
-    if lane_idx >= 0 {
-        let right_start = left_count as u32;
-        let mut j = 0u32;
-        while j < lane_idx as u32 {
-            let l = lanes[(section.lane_offset + right_start + j) as usize];
-            offset += l.width;
-            j += 1;
-        }
-        let current = lanes[(section.lane_offset + right_start + lane_idx as u32) as usize];
-        offset += current.width * 0.5;
-        offset = -offset;
-    } else {
-        let left_idx = (-lane_idx - 1) as u32;
-        let mut j = 0u32;
-        while j < left_idx {
-            let l = lanes[(section.lane_offset + j) as usize];
-            offset += l.width;
-            j += 1;
-        }
-        let current = lanes[(section.lane_offset + left_idx) as usize];
-        offset += current.width * 0.5;
-    }
-
-    offset
-}
-
 #[spirv(vertex)]
 pub fn vs_main(
     #[spirv(vertex_index)] vi: u32,
@@ -121,16 +32,20 @@ pub fn vs_main(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] roads: &[GpuRoad],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] lane_sections: &[GpuLaneSection],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 8)] lanes_buf: &[GpuLane],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 9)] visible_indices: &[u32],
     #[spirv(position)] out_pos: &mut Vec4,
     #[spirv(location = 0)] out_color: &mut Vec3,
     #[spirv(location = 1)] out_uv: &mut Vec2,
     #[spirv(location = 2)] out_speed_ratio: &mut f32,
 ) {
-    let road_id = car_road_id[ii as usize];
-    let s = car_s[ii as usize];
-    let lane = car_lane[ii as usize];
-    let speed = car_speed[ii as usize];
-    let desired = car_desired_speed[ii as usize];
+    // Indirect draw: look up actual car index from visibility buffer
+    let car_idx = visible_indices[ii as usize] as usize;
+
+    let road_id = car_road_id[car_idx];
+    let s = car_s[car_idx];
+    let lane = car_lane[car_idx];
+    let speed = car_speed[car_idx];
+    let desired = car_desired_speed[car_idx];
 
     let pose = evaluate_road_at_s(road_id, s, roads, segments);
     let lat_offset = compute_lane_offset(road_id, lane, s, roads, lane_sections, lanes_buf);

@@ -49,3 +49,23 @@ pub struct TileHeader {
     pub offset: u32,
     pub count: u32,
 }
+
+/// Matches `VkDrawIndirectCommand` layout.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct DrawIndirectCommand {
+    pub vertex_count: u32,
+    pub instance_count: u32,
+    pub first_vertex: u32,
+    pub first_instance: u32,
+}
+
+/// Per-tile instance data for indirect tile rendering.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct GpuTileInstance {
+    pub atlas_uv_offset: [f32; 2],
+    pub atlas_uv_scale: [f32; 2],
+    pub tile_world_origin: [f32; 2],
+    pub tile_world_size: [f32; 2],
+}

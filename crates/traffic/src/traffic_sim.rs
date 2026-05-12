@@ -472,6 +472,7 @@ impl TrafficSim {
         lane_section_buffer: Option<&GpuBuffer>,
         lane_buffer: Option<&GpuBuffer>,
         road_lane_counts_buf: Option<&GpuBuffer>,
+        visible_indices_buf: Option<&GpuBuffer>,
     ) {
         if !self.initialized {
             return;
@@ -503,12 +504,13 @@ impl TrafficSim {
             None => return,
         };
 
-        // Car renderer descriptors (bindings 0-4: car buffers, 5-8: road data)
-        if let (Some(seg_buf), Some(rd_buf), Some(ls_buf), Some(ln_buf)) = (
+        // Car renderer descriptors (bindings 0-4: car buffers, 5-8: road data, 9: visible_indices)
+        if let (Some(seg_buf), Some(rd_buf), Some(ls_buf), Some(ln_buf), Some(vis_buf)) = (
             segment_buffer,
             road_buffer,
             lane_section_buffer,
             lane_buffer,
+            visible_indices_buf,
         ) && let Some(renderer) = &mut self.car_renderer
         {
             renderer.update_descriptors(
@@ -522,6 +524,7 @@ impl TrafficSim {
                 rd_buf,
                 ls_buf,
                 ln_buf,
+                vis_buf,
             );
         }
 
@@ -897,12 +900,13 @@ impl TrafficSim {
         }
     }
 
-    /// Draw cars using instanced rendering. Caller must have begun dynamic rendering.
+    /// Draw cars using indirect instanced rendering. Caller must have begun dynamic rendering.
     pub fn draw_cars(
         &self,
         device: &engine::VkDevice,
         cmd: vk::CommandBuffer,
         view_proj: [[f32; 4]; 4],
+        indirect_buffer: vk::Buffer,
     ) {
         if !self.initialized || self.car_count == 0 {
             return;
@@ -917,13 +921,23 @@ impl TrafficSim {
                 _pad1: 0,
                 _pad2: 0,
             };
-            renderer.draw(device, cmd, &pc);
+            renderer.draw_indirect(device, cmd, &pc, indirect_buffer);
         }
     }
 
     /// Whether a MOBIL lane change should run this tick.
     pub fn should_lane_change(&self) -> bool {
         self.sim_tick.is_multiple_of(LANE_CHANGE_INTERVAL)
+    }
+
+    /// Access car SoA buffers for frustum cull descriptor binding.
+    pub fn car_buffers(
+        &self,
+    ) -> Option<(&GpuBuffer, &GpuBuffer, &GpuBuffer)> {
+        match (&self.car_road_id_buf, &self.car_s_buf, &self.car_lane_buf) {
+            (Some(road_id), Some(s), Some(lane)) => Some((road_id, s, lane)),
+            _ => None,
+        }
     }
 
     fn destroy_buffers(&mut self, allocator: &engine::vma::Allocator) {

@@ -18,10 +18,6 @@ use crate::pipeline::{
 pub const TILE_SIZE: f32 = 64.0;
 /// Texels per tile dimension.
 pub const TILE_RESOLUTION: u32 = 256;
-/// Atlas dimension in tiles (32 × 32 = 1024 tile slots).
-pub const ATLAS_TILES: u32 = 32;
-/// Atlas dimension in texels.
-const ATLAS_SIZE: u32 = ATLAS_TILES * TILE_RESOLUTION; // 8192
 
 // ---------------------------------------------------------------------------
 // Push constants — must match the shader
@@ -68,8 +64,6 @@ impl TileKey {
 
 /// CPU-side tile data.
 pub struct TileInfo {
-    /// Atlas slot index (0..ATLAS_TILES*ATLAS_TILES).
-    pub atlas_slot: u32,
     /// Index into the tile_headers GPU buffer.
     pub header_index: u32,
 }
@@ -90,28 +84,21 @@ pub struct TileHeader {
 pub struct TileMap {
     /// Active tiles keyed by tile coordinate.
     pub tiles: HashMap<TileKey, TileInfo>,
-    /// Free atlas slot stack.
-    free_slots: Vec<u32>,
     /// Tile headers (one per active tile, indexed by header_index).
     pub headers: Vec<TileHeader>,
     /// Flat list of segment indices per tile (offsets stored in headers).
     pub segment_indices: Vec<u32>,
     /// Road index per entry in segment_indices (parallel array).
     pub road_indices: Vec<u32>,
-    /// Set of tiles that need re-dispatch.
-    pub dirty_tiles: HashSet<TileKey>,
 }
 
 impl TileMap {
     pub fn new() -> Self {
-        let total_slots = (ATLAS_TILES * ATLAS_TILES) as u32;
         Self {
             tiles: HashMap::new(),
-            free_slots: (0..total_slots).rev().collect(),
             headers: Vec::new(),
             segment_indices: Vec::new(),
             road_indices: Vec::new(),
-            dirty_tiles: HashSet::new(),
         }
     }
 
@@ -120,16 +107,10 @@ impl TileMap {
     /// tuples — we compute AABB overlap with each tile.
     pub fn rebuild(&mut self, segment_data: &[SegmentAABB]) {
         // Clear old data
-        let old_keys: Vec<TileKey> = self.tiles.keys().cloned().collect();
-        for key in &old_keys {
-            if let Some(info) = self.tiles.remove(key) {
-                self.free_slots.push(info.atlas_slot);
-            }
-        }
+        self.tiles.clear();
         self.headers.clear();
         self.segment_indices.clear();
         self.road_indices.clear();
-        self.dirty_tiles.clear();
 
         // Collect which segments overlap which tiles
         let mut tile_segments: HashMap<TileKey, Vec<(u32, u32)>> = HashMap::new();
@@ -152,16 +133,8 @@ impl TileMap {
             }
         }
 
-        // Allocate atlas slots and build headers
+        // Build headers (no atlas slot assignment — that's the streaming cache's job)
         for (key, seg_list) in &tile_segments {
-            let slot = match self.free_slots.pop() {
-                Some(s) => s,
-                None => {
-                    // Atlas full — skip tile
-                    continue;
-                }
-            };
-
             let header_index = self.headers.len() as u32;
             let offset = self.segment_indices.len() as u32;
             let count = seg_list.len() as u32;
@@ -174,12 +147,8 @@ impl TileMap {
             self.headers.push(TileHeader { offset, count });
             self.tiles.insert(
                 *key,
-                TileInfo {
-                    atlas_slot: slot,
-                    header_index,
-                },
+                TileInfo { header_index },
             );
-            self.dirty_tiles.insert(*key);
         }
     }
 }
@@ -196,9 +165,14 @@ pub struct SegmentAABB {
 // SdfTileManager — GPU resources for SDF tile generation
 // ---------------------------------------------------------------------------
 
+/// Default atlas dimension in tiles (32 × 32 = 1024 slots, 8192 × 8192 texels).
+const DEFAULT_ATLAS_TILES: u32 = 32;
+
 pub struct SdfTileManager {
-    // Atlas image (RGBA32F, ATLAS_SIZE × ATLAS_SIZE)
+    // Atlas image (RGBA16F, fixed size)
     pub atlas: GpuImage,
+    /// Atlas dimension in tiles (fixed at creation).
+    pub atlas_tiles_dim: u32,
 
     // Compute pipeline
     pipeline: vk::Pipeline,
@@ -212,8 +186,20 @@ pub struct SdfTileManager {
     tile_segment_index_buffer: Option<GpuBuffer>,
     tile_road_index_buffer: Option<GpuBuffer>,
 
-    // Tile bookkeeping
+    // Tile bookkeeping (infinite)
     pub tile_map: TileMap,
+
+    // Atlas streaming cache
+    /// Maps atlas slot index → tile key currently occupying it (None if free).
+    slot_to_tile: Vec<Option<TileKey>>,
+    /// Maps tile key → atlas slot for tiles currently loaded in the atlas.
+    pub tile_to_slot: HashMap<TileKey, u32>,
+    /// Free atlas slot stack.
+    free_slots: Vec<u32>,
+    /// Tiles that need their SDF re-generated (newly assigned slots).
+    pub dirty_tiles: HashSet<TileKey>,
+    /// Set to true when the set of loaded tiles changes (for re-uploading tile instances).
+    pub tiles_changed: bool,
 }
 
 impl SdfTileManager {
@@ -223,12 +209,13 @@ impl SdfTileManager {
         allocator: &vma::Allocator,
         spirv: &[u32],
     ) -> anyhow::Result<Self> {
-        // Create atlas image (RGBA16F for signed_dist, s, road_id, unused)
+        let atlas_dim = DEFAULT_ATLAS_TILES;
+        let atlas_size = atlas_dim * TILE_RESOLUTION;
         let atlas = GpuImage::new_storage_2d(
             device,
             allocator,
-            ATLAS_SIZE,
-            ATLAS_SIZE,
+            atlas_size,
+            atlas_size,
             vk::Format::R16G16B16A16_SFLOAT,
         )?;
 
@@ -323,8 +310,10 @@ impl SdfTileManager {
             device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
         }
 
+        let total_slots = atlas_dim * atlas_dim;
         Ok(Self {
             atlas,
+            atlas_tiles_dim: atlas_dim,
             pipeline,
             pipeline_layout,
             descriptor_set_layout,
@@ -334,7 +323,91 @@ impl SdfTileManager {
             tile_segment_index_buffer: None,
             tile_road_index_buffer: None,
             tile_map: TileMap::new(),
+            slot_to_tile: vec![None; total_slots as usize],
+            tile_to_slot: HashMap::new(),
+            free_slots: (0..total_slots).rev().collect(),
+            dirty_tiles: HashSet::new(),
+            tiles_changed: false,
         })
+    }
+
+    /// Update which tiles are loaded in the atlas based on the camera view.
+    /// Tiles visible in the AABB are loaded; non-visible tiles may be evicted.
+    /// Call this each frame before `dispatch_dirty_tiles`.
+    pub fn update_visible(&mut self, min_x: f32, min_y: f32, max_x: f32, max_y: f32) {
+        if self.tile_map.tiles.is_empty() {
+            return;
+        }
+
+        // Determine which tile keys overlap the view AABB
+        let tile_min_ix = (min_x / TILE_SIZE).floor() as i32;
+        let tile_min_iy = (min_y / TILE_SIZE).floor() as i32;
+        let tile_max_ix = (max_x / TILE_SIZE).floor() as i32;
+        let tile_max_iy = (max_y / TILE_SIZE).floor() as i32;
+
+        let mut visible_set: HashSet<TileKey> = HashSet::new();
+        for iy in tile_min_iy..=tile_max_iy {
+            for ix in tile_min_ix..=tile_max_ix {
+                let key = TileKey { ix, iy };
+                if self.tile_map.tiles.contains_key(&key) {
+                    visible_set.insert(key);
+                }
+            }
+        }
+
+        // Find visible tiles not yet in the atlas
+        let mut to_load: Vec<TileKey> = Vec::new();
+        for &key in &visible_set {
+            if !self.tile_to_slot.contains_key(&key) {
+                to_load.push(key);
+            }
+        }
+
+        if to_load.is_empty() {
+            return;
+        }
+
+        // Evict non-visible tiles if we need more free slots
+        if self.free_slots.len() < to_load.len() {
+            // Collect currently loaded but non-visible tiles
+            let mut evict_candidates: Vec<TileKey> = self
+                .tile_to_slot
+                .keys()
+                .filter(|k| !visible_set.contains(k))
+                .cloned()
+                .collect();
+
+            let needed = to_load.len() - self.free_slots.len();
+            // Evict as many as needed
+            for key in evict_candidates.drain(..needed.min(evict_candidates.len())) {
+                if let Some(slot) = self.tile_to_slot.remove(&key) {
+                    self.slot_to_tile[slot as usize] = None;
+                    self.free_slots.push(slot);
+                }
+            }
+        }
+
+        // Assign slots to newly visible tiles
+        for key in to_load {
+            if let Some(slot) = self.free_slots.pop() {
+                self.slot_to_tile[slot as usize] = Some(key);
+                self.tile_to_slot.insert(key, slot);
+                self.dirty_tiles.insert(key);
+                self.tiles_changed = true;
+            }
+            // If no free slot available, this tile won't be rendered — atlas is full
+        }
+    }
+
+    /// Clear all atlas slot assignments (call when roads are rebuilt).
+    pub fn clear_slots(&mut self) {
+        let total_slots = self.atlas_tiles_dim * self.atlas_tiles_dim;
+        self.slot_to_tile.fill(None);
+        self.tile_to_slot.clear();
+        self.free_slots.clear();
+        self.free_slots.extend((0..total_slots).rev());
+        self.dirty_tiles.clear();
+        self.tiles_changed = true;
     }
 
     /// Upload tile map data to GPU and update descriptors for segment/tile buffers.
@@ -346,6 +419,9 @@ impl SdfTileManager {
         segment_buffer: vk::Buffer,
         segment_buffer_size: u64,
     ) -> anyhow::Result<()> {
+        // Clear atlas slot assignments since tile indices may have changed
+        self.clear_slots();
+
         // Destroy old buffers
         if let Some(b) = self.tile_header_buffer.take() {
             b.destroy(allocator);
@@ -467,7 +543,7 @@ impl SdfTileManager {
     /// Record compute dispatches for all dirty tiles. Call this during command
     /// buffer recording. The atlas image must be in GENERAL layout.
     pub fn dispatch_dirty_tiles(&mut self, device: &Device, cmd: vk::CommandBuffer) {
-        if self.tile_map.dirty_tiles.is_empty() {
+        if self.dirty_tiles.is_empty() {
             return;
         }
 
@@ -483,17 +559,20 @@ impl SdfTileManager {
             );
         }
 
-        let dirty: Vec<TileKey> = self.tile_map.dirty_tiles.drain().collect();
+        let dirty: Vec<TileKey> = self.dirty_tiles.drain().collect();
         for key in &dirty {
             let info = match self.tile_map.tiles.get(key) {
                 Some(info) => info,
                 None => continue,
             };
+            let slot = match self.tile_to_slot.get(key) {
+                Some(&s) => s,
+                None => continue,
+            };
 
             // Compute atlas texel offset from slot index
-            let slot = info.atlas_slot;
-            let slot_x = slot % ATLAS_TILES;
-            let slot_y = slot / ATLAS_TILES;
+            let slot_x = slot % self.atlas_tiles_dim;
+            let slot_y = slot / self.atlas_tiles_dim;
             let atlas_offset_x = slot_x * TILE_RESOLUTION;
             let atlas_offset_y = slot_y * TILE_RESOLUTION;
 
@@ -528,7 +607,7 @@ impl SdfTileManager {
 
     /// Check if there are dirty tiles that need dispatching.
     pub fn has_dirty_tiles(&self) -> bool {
-        !self.tile_map.dirty_tiles.is_empty()
+        !self.dirty_tiles.is_empty()
     }
 
     /// Destroy all GPU resources.

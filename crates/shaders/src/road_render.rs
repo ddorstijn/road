@@ -1,4 +1,4 @@
-use gpu_shared::{GpuLane, GpuLaneSection, GpuRoad};
+use gpu_shared::{GpuLane, GpuLaneSection, GpuRoad, GpuTileInstance};
 use spirv_std::glam::{Mat4, Vec2, Vec3, Vec4};
 use spirv_std::image::Image2d;
 use spirv_std::spirv;
@@ -8,10 +8,6 @@ use spirv_std::Sampler;
 #[derive(Clone, Copy)]
 pub struct PushConstants {
     pub view_proj: Mat4,
-    pub atlas_uv_offset: Vec2,
-    pub atlas_uv_scale: Vec2,
-    pub tile_world_origin: Vec2,
-    pub tile_world_size: Vec2,
 }
 
 // Marking constants
@@ -29,10 +25,18 @@ const YELLOW: Vec3 = Vec3::new(1.0, 0.85, 0.0);
 #[spirv(vertex)]
 pub fn vs_main(
     #[spirv(vertex_index)] vi: u32,
+    #[spirv(instance_index)] ii: u32,
     #[spirv(push_constant)] pc: &PushConstants,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] tile_instances: &[GpuTileInstance],
     #[spirv(position)] out_pos: &mut Vec4,
     #[spirv(location = 0)] out_uv: &mut Vec2,
 ) {
+    let tile = tile_instances[ii as usize];
+    let tile_world_origin = Vec2::new(tile.tile_world_origin[0], tile.tile_world_origin[1]);
+    let tile_world_size = Vec2::new(tile.tile_world_size[0], tile.tile_world_size[1]);
+    let atlas_uv_offset = Vec2::new(tile.atlas_uv_offset[0], tile.atlas_uv_offset[1]);
+    let atlas_uv_scale = Vec2::new(tile.atlas_uv_scale[0], tile.atlas_uv_scale[1]);
+
     let (qx, qy) = match vi {
         0 => (0.0f32, 0.0f32),
         1 => (1.0, 0.0),
@@ -42,9 +46,9 @@ pub fn vs_main(
         _ => (0.0, 1.0),
     };
     let local = Vec2::new(qx, qy);
-    let world = pc.tile_world_origin + local * pc.tile_world_size;
+    let world = tile_world_origin + local * tile_world_size;
     *out_pos = pc.view_proj * Vec4::new(world.x, world.y, 0.0, 1.0);
-    *out_uv = pc.atlas_uv_offset + local * pc.atlas_uv_scale;
+    *out_uv = atlas_uv_offset + local * atlas_uv_scale;
 }
 
 #[spirv(fragment)]

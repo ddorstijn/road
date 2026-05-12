@@ -3,6 +3,7 @@
 pub mod road_eval;
 
 pub mod car_render;
+pub mod frustum_cull;
 pub mod grid;
 pub mod road_line;
 pub mod road_render;

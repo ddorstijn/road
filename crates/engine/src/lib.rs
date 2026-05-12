@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod car_renderer;
 pub mod core;
+pub mod frustum_cull;
 pub mod gpu_pipeline_stats;
 pub mod gpu_resources;
 pub mod gpu_timestamps;
