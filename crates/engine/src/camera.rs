@@ -63,10 +63,10 @@ impl Camera2D {
         let aspect = window_width as f32 / window_height as f32;
         let half_w = half_h * aspect;
 
-        // Grab-pan: drag right → camera moves left, drag down → camera moves up.
-        // Screen Y increases downward, world Y increases upward, so negate dy.
+        // Grab-pan: drag right → camera moves left, drag down → camera moves down.
+        // The view-projection already flips Y (top/bottom swap), so no extra negate on dy.
         let world_dx = -(dx as f32) * (2.0 * half_w) / window_width as f32;
-        let world_dy = -(dy as f32) * (2.0 * half_h) / window_height as f32;
+        let world_dy = (dy as f32) * (2.0 * half_h) / window_height as f32;
 
         self.position.x += world_dx;
         self.position.y += world_dy;
