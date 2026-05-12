@@ -68,4 +68,6 @@ pub struct GpuTileInstance {
     pub atlas_uv_scale: [f32; 2],
     pub tile_world_origin: [f32; 2],
     pub tile_world_size: [f32; 2],
+    pub road_id_uv_offset: [f32; 2],
+    pub road_id_uv_scale: [f32; 2],
 }

@@ -7,6 +7,7 @@ pub mod gpu_resources;
 pub mod gpu_timestamps;
 pub mod pipeline;
 pub mod sdf;
+pub mod tile_cache;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -57,6 +58,8 @@ pub struct EngineContext<'a> {
     pub frame_number: u64,
     pub window: Option<&'a Window>,
     pub timestamp_period: f32,
+    pub graphics_queue: vk::Queue,
+    pub graphics_queue_family: u32,
 }
 
 pub trait App {
@@ -167,6 +170,8 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
             frame_number: 0,
             window: self.window.as_deref(),
             timestamp_period: core.timestamp_period(),
+            graphics_queue: core.graphics_queue(),
+            graphics_queue_family: core.graphics_queue_family(),
         };
         self.app.init(&ctx).expect("App::init failed");
     }
@@ -195,6 +200,8 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                         frame_number: 0,
                         window: None,
                         timestamp_period: core.timestamp_period(),
+                        graphics_queue: core.graphics_queue(),
+                        graphics_queue_family: core.graphics_queue_family(),
                     };
                     self.app.shutdown(&ctx);
                 }
@@ -217,6 +224,8 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                         frame_number: 0,
                         window: None,
                         timestamp_period: core.timestamp_period(),
+                        graphics_queue: core.graphics_queue(),
+                        graphics_queue_family: core.graphics_queue_family(),
                     };
                     self.app.resize(&ctx).expect("App::resize failed");
                 }
@@ -345,6 +354,8 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                     let draw_image_ref: *const GpuImage = core.draw_image();
                     let window_ref: Option<&Window> = self.window.as_deref();
                     let timestamp_period = core.timestamp_period();
+                    let gfx_queue = core.graphics_queue();
+                    let gfx_queue_family = core.graphics_queue_family();
 
                     core.draw_frame(|_device, cmd, _draw_image| {
                         let ctx = EngineContext {
@@ -359,6 +370,8 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                             frame_number,
                             window: window_ref,
                             timestamp_period,
+                            graphics_queue: gfx_queue,
+                            graphics_queue_family: gfx_queue_family,
                         };
                         self.app.render(&ctx, cmd).expect("App::render failed");
                     })

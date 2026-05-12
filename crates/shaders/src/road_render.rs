@@ -30,12 +30,15 @@ pub fn vs_main(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] tile_instances: &[GpuTileInstance],
     #[spirv(position)] out_pos: &mut Vec4,
     #[spirv(location = 0)] out_uv: &mut Vec2,
+    #[spirv(location = 1)] out_road_id_uv: &mut Vec2,
 ) {
     let tile = tile_instances[ii as usize];
     let tile_world_origin = Vec2::new(tile.tile_world_origin[0], tile.tile_world_origin[1]);
     let tile_world_size = Vec2::new(tile.tile_world_size[0], tile.tile_world_size[1]);
     let atlas_uv_offset = Vec2::new(tile.atlas_uv_offset[0], tile.atlas_uv_offset[1]);
     let atlas_uv_scale = Vec2::new(tile.atlas_uv_scale[0], tile.atlas_uv_scale[1]);
+    let road_id_uv_offset = Vec2::new(tile.road_id_uv_offset[0], tile.road_id_uv_offset[1]);
+    let road_id_uv_scale = Vec2::new(tile.road_id_uv_scale[0], tile.road_id_uv_scale[1]);
 
     let (qx, qy) = match vi {
         0 => (0.0f32, 0.0f32),
@@ -49,25 +52,34 @@ pub fn vs_main(
     let world = tile_world_origin + local * tile_world_size;
     *out_pos = pc.view_proj * Vec4::new(world.x, world.y, 0.0, 1.0);
     *out_uv = atlas_uv_offset + local * atlas_uv_scale;
+    *out_road_id_uv = road_id_uv_offset + local * road_id_uv_scale;
 }
 
 #[spirv(fragment)]
 pub fn fs_main(
     #[spirv(location = 0)] uv: Vec2,
+    #[spirv(location = 1)] road_id_uv: Vec2,
     #[spirv(descriptor_set = 0, binding = 0)] sdf_tex: &Image2d,
     #[spirv(descriptor_set = 0, binding = 1)] sdf_sampler: &Sampler,
     #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] roads: &[GpuRoad],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 3)]
     lane_sections_buf: &[GpuLaneSection],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] lanes_buf: &[GpuLane],
+    #[spirv(descriptor_set = 0, binding = 6)] road_id_tex: &Image2d,
+    #[spirv(descriptor_set = 0, binding = 7)] road_id_sampler: &Sampler,
     output: &mut Vec4,
 ) {
+    // Sample SDF atlas (bilinear): signed_dist + s_coord
     let sdf_val: Vec4 = sdf_tex.sample(*sdf_sampler, uv);
-
     let signed_dist = sdf_val.x;
     let s_coord = sdf_val.y;
-    let road_id_f = sdf_val.z;
-    let s_mod_period = sdf_val.w;
+
+    // Sample road ID atlas (nearest): discrete road id
+    let road_id_val: Vec4 = road_id_tex.sample(*road_id_sampler, road_id_uv);
+    let road_id_f = road_id_val.x;
+
+    // Compute s_mod_period inline (was channel A, removed to avoid wrapping discontinuity)
+    let s_mod_period = s_coord % 6.0;
 
     if road_id_f < 0.0 {
         spirv_std::arch::kill();
@@ -75,6 +87,12 @@ pub fn fs_main(
 
     let road_id = road_id_f as u32;
     let road = roads[road_id as usize];
+
+    // Kill fragments beyond the road extent (prevents endcap rendering
+    // where bilinear-interpolated SDF values leak past endpoints)
+    if s_coord < -0.5 || s_coord > road.total_length + 0.5 {
+        spirv_std::arch::kill();
+    }
 
     // Find lane section at this s-coordinate
     let mut section_idx = road.lane_section_offset;

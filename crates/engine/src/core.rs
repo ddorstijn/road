@@ -1,6 +1,5 @@
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
-use std::time::Duration;
 
 use vulkanalia::prelude::v1_4::*;
 use vulkanalia::vk::KhrSwapchainExtensionDeviceCommands;
@@ -148,11 +147,8 @@ impl Core {
         let frame = &self.frames[self.frame_number % FRAME_OVERLAP];
 
         unsafe {
-            self.device.wait_for_fences(
-                &[frame.render_fence],
-                true,
-                Duration::from_secs(1).as_nanos() as u64,
-            )?;
+            self.device
+                .wait_for_fences(&[frame.render_fence], true, u64::MAX)?;
             self.device.reset_fences(&[frame.render_fence])?;
 
             let (image_index, result) = self.device.acquire_next_image_khr(
@@ -314,6 +310,14 @@ impl Core {
 
     pub fn timestamp_period(&self) -> f32 {
         self.timestamp_period
+    }
+
+    pub fn graphics_queue(&self) -> vk::Queue {
+        self.graphics_queue
+    }
+
+    pub fn graphics_queue_family(&self) -> u32 {
+        self.graphics_queue_family
     }
 
     pub fn window_extent(&self) -> vk::Extent2D {

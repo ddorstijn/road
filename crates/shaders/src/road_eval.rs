@@ -136,11 +136,22 @@ pub fn world_to_segment_local(world_pos: Vec2, origin: Vec2, heading: f32) -> Ve
 // ---------------------------------------------------------------------------
 
 pub fn closest_point_line(point: Vec2, seg_len: f32) -> ClosestResult {
-    let s = point.x.clamp(0.0, seg_len);
+    let raw_s = point.x;
+    let s = raw_s.clamp(0.0, seg_len);
+    let clamped = raw_s < 0.0 || raw_s > seg_len;
     let closest = Vec2::new(s, 0.0);
     let diff = point - closest;
     let dist = diff.length();
-    let signed_dist = if point.y >= 0.0 { dist } else { -dist };
+    // At endpoints (s clamped), use unsigned distance to avoid a sign
+    // discontinuity along the tangent that creates spike artifacts
+    // when bilinearly interpolated.
+    let signed_dist = if clamped {
+        dist
+    } else if point.y >= 0.0 {
+        dist
+    } else {
+        -dist
+    };
     ClosestResult { s, signed_dist }
 }
 
@@ -158,6 +169,7 @@ pub fn closest_point_arc(point: Vec2, seg_length: f32, curvature: f32) -> Closes
 
     let max_angle = (seg_length * curvature).abs();
     let clamped_angle = unsigned_angle.clamp(0.0, max_angle);
+    let endpoint_clamped = unsigned_angle < 0.0 || unsigned_angle > max_angle;
     let s = clamped_angle / curvature.abs();
 
     let closest_pt = eval_arc(s, curvature);
@@ -167,7 +179,15 @@ pub fn closest_point_arc(point: Vec2, seg_length: f32, curvature: f32) -> Closes
     let hdg = heading_arc(s, curvature);
     let tangent = Vec2::new(hdg.cos(), hdg.sin());
     let cross = tangent.x * diff.y - tangent.y * diff.x;
-    let signed_dist = if cross >= 0.0 { dist } else { -dist };
+    // At endpoints (angle clamped), use unsigned distance to avoid sign
+    // discontinuity that creates spike artifacts when bilinearly interpolated.
+    let signed_dist = if endpoint_clamped {
+        dist
+    } else if cross >= 0.0 {
+        dist
+    } else {
+        -dist
+    };
 
     ClosestResult { s, signed_dist }
 }
@@ -224,7 +244,16 @@ pub fn closest_point_spiral(
     let hdg = heading_spiral(s, k_start, k_end, seg_length);
     let tangent = Vec2::new(hdg.cos(), hdg.sin());
     let cross = tangent.x * diff.y - tangent.y * diff.x;
-    let signed_dist = if cross >= 0.0 { dist } else { -dist };
+    // At endpoints (s clamped), use unsigned distance to avoid sign
+    // discontinuity that creates spike artifacts when bilinearly interpolated.
+    let endpoint_clamped = s <= 0.001 || s >= seg_length - 0.001;
+    let signed_dist = if endpoint_clamped {
+        dist
+    } else if cross >= 0.0 {
+        dist
+    } else {
+        -dist
+    };
 
     ClosestResult { s, signed_dist }
 }

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use vulkanalia::prelude::v1_4::*;
@@ -9,6 +10,7 @@ use crate::gpu_resources::{GpuBuffer, GpuImage};
 use crate::pipeline::{
     allocate_descriptor_set, create_compute_pipeline, create_descriptor_set_layout,
 };
+use crate::tile_cache::{SdfCacheFile, TileLoadQueue};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -16,8 +18,10 @@ use crate::pipeline::{
 
 /// World-space size of each tile in meters.
 pub const TILE_SIZE: f32 = 64.0;
-/// Texels per tile dimension.
-pub const TILE_RESOLUTION: u32 = 256;
+/// Texels per tile dimension for the SDF atlas (signed_dist, s_coord).
+pub const TILE_RESOLUTION: u32 = 64;
+/// Texels per tile dimension for the road-ID atlas.
+pub const ROAD_ID_RESOLUTION: u32 = 32;
 
 // ---------------------------------------------------------------------------
 // Push constants — must match the shader
@@ -33,7 +37,10 @@ struct SdfPushConstants {
     tile_size: f32,
     tile_resolution: u32,
     tile_index: u32,
-    _pad: u32,
+    road_id_atlas_offset_x: u32,
+    road_id_atlas_offset_y: u32,
+    road_id_resolution: u32,
+    _pad: [u32; 2],
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +112,29 @@ impl TileMap {
     /// Rebuild tile data from road segments.
     /// `segments` is the flat array of (origin, heading, length, segment_index, road_index)
     /// tuples — we compute AABB overlap with each tile.
-    pub fn rebuild(&mut self, segment_data: &[SegmentAABB]) {
+    ///
+    /// Returns the set of tile keys whose segment content changed (added, removed,
+    /// or segment set differs). This can be used to invalidate stale cache entries.
+    pub fn rebuild(&mut self, segment_data: &[SegmentAABB]) -> HashSet<TileKey> {
+        // Snapshot old per-tile segment sets for change detection
+        let old_tile_segs: HashMap<TileKey, Vec<(u32, u32)>> = self
+            .tiles
+            .keys()
+            .map(|&key| {
+                let info = &self.tiles[&key];
+                let hdr = &self.headers[info.header_index as usize];
+                let start = hdr.offset as usize;
+                let end = start + hdr.count as usize;
+                let mut segs: Vec<(u32, u32)> = self.segment_indices[start..end]
+                    .iter()
+                    .zip(&self.road_indices[start..end])
+                    .map(|(&s, &r)| (s, r))
+                    .collect();
+                segs.sort();
+                (key, segs)
+            })
+            .collect();
+
         // Clear old data
         self.tiles.clear();
         self.headers.clear();
@@ -145,11 +174,36 @@ impl TileMap {
             }
 
             self.headers.push(TileHeader { offset, count });
-            self.tiles.insert(
-                *key,
-                TileInfo { header_index },
-            );
+            self.tiles.insert(*key, TileInfo { header_index });
         }
+
+        // Compute changed tiles
+        let mut changed = HashSet::new();
+
+        // Tiles that existed before but are gone or have different segments
+        for (key, old_segs) in &old_tile_segs {
+            match tile_segments.get(key) {
+                None => {
+                    changed.insert(*key);
+                } // removed
+                Some(new_segs) => {
+                    let mut sorted_new = new_segs.clone();
+                    sorted_new.sort();
+                    if *old_segs != sorted_new {
+                        changed.insert(*key);
+                    }
+                }
+            }
+        }
+
+        // Tiles that are new (didn't exist before)
+        for key in tile_segments.keys() {
+            if !old_tile_segs.contains_key(key) {
+                changed.insert(*key);
+            }
+        }
+
+        changed
     }
 }
 
@@ -169,8 +223,10 @@ pub struct SegmentAABB {
 const DEFAULT_ATLAS_TILES: u32 = 32;
 
 pub struct SdfTileManager {
-    // Atlas image (RGBA16F, fixed size)
-    pub atlas: GpuImage,
+    // SDF atlas (RG16F — signed_dist + s_coord, bilinear sampled)
+    pub sdf_atlas: GpuImage,
+    // Road ID atlas (R16_UINT — discrete road id, nearest sampled)
+    pub road_id_atlas: GpuImage,
     /// Atlas dimension in tiles (fixed at creation).
     pub atlas_tiles_dim: u32,
 
@@ -200,6 +256,19 @@ pub struct SdfTileManager {
     pub dirty_tiles: HashSet<TileKey>,
     /// Set to true when the set of loaded tiles changes (for re-uploading tile instances).
     pub tiles_changed: bool,
+
+    // Disk cache (optional)
+    cache: Option<SdfCacheFile>,
+    load_queue: Option<TileLoadQueue>,
+    /// Tiles currently being loaded from disk cache.
+    loading_tiles: HashSet<TileKey>,
+
+    // Staging buffer for cache→GPU uploads
+    staging_buffer: Option<GpuBuffer>,
+    staging_ptr: *mut u8,
+
+    /// Current image layout of both atlas textures (they always share the same layout).
+    pub atlas_layout: vk::ImageLayout,
 }
 
 impl SdfTileManager {
@@ -210,21 +279,34 @@ impl SdfTileManager {
         spirv: &[u32],
     ) -> anyhow::Result<Self> {
         let atlas_dim = DEFAULT_ATLAS_TILES;
-        let atlas_size = atlas_dim * TILE_RESOLUTION;
-        let atlas = GpuImage::new_storage_2d(
+
+        // SDF atlas: RG16F, bilinear-sampled (signed_dist + s_coord)
+        let sdf_atlas_size = atlas_dim * TILE_RESOLUTION;
+        let sdf_atlas = GpuImage::new_storage_2d(
             device,
             allocator,
-            atlas_size,
-            atlas_size,
-            vk::Format::R16G16B16A16_SFLOAT,
+            sdf_atlas_size,
+            sdf_atlas_size,
+            vk::Format::R16G16_SFLOAT,
+        )?;
+
+        // Road ID atlas: R16_SFLOAT, nearest-sampled (discrete road id stored as float)
+        let road_id_atlas_size = atlas_dim * ROAD_ID_RESOLUTION;
+        let road_id_atlas = GpuImage::new_storage_2d(
+            device,
+            allocator,
+            road_id_atlas_size,
+            road_id_atlas_size,
+            vk::Format::R16_SFLOAT,
         )?;
 
         // Descriptor set layout:
-        //   binding 0: storage image (atlas) — write
+        //   binding 0: storage image (sdf atlas) — write
         //   binding 1: storage buffer (segments) — read
         //   binding 2: storage buffer (tile_headers) — read
         //   binding 3: storage buffer (tile_segment_indices) — read
         //   binding 4: storage buffer (road_indices) — read
+        //   binding 5: storage image (road_id atlas) — write
         let bindings = [
             vk::DescriptorSetLayoutBinding::builder()
                 .binding(0)
@@ -256,6 +338,12 @@ impl SdfTileManager {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
                 .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .build(),
         ];
 
         let descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
@@ -264,7 +352,7 @@ impl SdfTileManager {
         let pool_sizes = [
             vk::DescriptorPoolSize::builder()
                 .type_(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(1)
+                .descriptor_count(2)
                 .build(),
             vk::DescriptorPoolSize::builder()
                 .type_(vk::DescriptorType::STORAGE_BUFFER)
@@ -294,25 +382,39 @@ impl SdfTileManager {
             &push_constant_ranges,
         )?;
 
-        // Write atlas descriptor (binding 0) — the image is always the same
-        let image_info = [vk::DescriptorImageInfo::builder()
-            .image_view(atlas.view)
+        // Write atlas descriptors (binding 0: sdf atlas, binding 5: road_id atlas)
+        let sdf_image_info = [vk::DescriptorImageInfo::builder()
+            .image_view(sdf_atlas.view)
             .image_layout(vk::ImageLayout::GENERAL)
             .build()];
-        let writes = [vk::WriteDescriptorSet::builder()
-            .dst_set(descriptor_set)
-            .dst_binding(0)
-            .dst_array_element(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-            .image_info(&image_info)
+        let road_id_image_info = [vk::DescriptorImageInfo::builder()
+            .image_view(road_id_atlas.view)
+            .image_layout(vk::ImageLayout::GENERAL)
             .build()];
+        let writes = [
+            vk::WriteDescriptorSet::builder()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&sdf_image_info)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(descriptor_set)
+                .dst_binding(5)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&road_id_image_info)
+                .build(),
+        ];
         unsafe {
             device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
         }
 
         let total_slots = atlas_dim * atlas_dim;
         Ok(Self {
-            atlas,
+            sdf_atlas,
+            road_id_atlas,
             atlas_tiles_dim: atlas_dim,
             pipeline,
             pipeline_layout,
@@ -328,6 +430,12 @@ impl SdfTileManager {
             free_slots: (0..total_slots).rev().collect(),
             dirty_tiles: HashSet::new(),
             tiles_changed: false,
+            cache: None,
+            load_queue: None,
+            loading_tiles: HashSet::new(),
+            staging_buffer: None,
+            staging_ptr: std::ptr::null_mut(),
+            atlas_layout: vk::ImageLayout::UNDEFINED,
         })
     }
 
@@ -392,8 +500,31 @@ impl SdfTileManager {
             if let Some(slot) = self.free_slots.pop() {
                 self.slot_to_tile[slot as usize] = Some(key);
                 self.tile_to_slot.insert(key, slot);
-                self.dirty_tiles.insert(key);
                 self.tiles_changed = true;
+
+                // Check if tile is in the disk cache
+                let in_cache = self
+                    .cache
+                    .as_ref()
+                    .map(|c| c.has_tile(key))
+                    .unwrap_or(false);
+
+                if in_cache {
+                    // Submit async load from disk
+                    if let Some(lq) = self.load_queue.as_mut() {
+                        if lq.request(key, slot) {
+                            self.loading_tiles.insert(key);
+                        } else {
+                            // Queue full, fall back to GPU generation
+                            self.dirty_tiles.insert(key);
+                        }
+                    } else {
+                        self.dirty_tiles.insert(key);
+                    }
+                } else {
+                    // Not cached — GPU-generate
+                    self.dirty_tiles.insert(key);
+                }
             }
             // If no free slot available, this tile won't be rendered — atlas is full
         }
@@ -408,6 +539,8 @@ impl SdfTileManager {
         self.free_slots.extend((0..total_slots).rev());
         self.dirty_tiles.clear();
         self.tiles_changed = true;
+        // All atlas data is now stale — next dispatch should discard contents
+        self.atlas_layout = vk::ImageLayout::UNDEFINED;
     }
 
     /// Upload tile map data to GPU and update descriptors for segment/tile buffers.
@@ -570,11 +703,15 @@ impl SdfTileManager {
                 None => continue,
             };
 
-            // Compute atlas texel offset from slot index
+            // SDF atlas texel offset from slot index
             let slot_x = slot % self.atlas_tiles_dim;
             let slot_y = slot / self.atlas_tiles_dim;
             let atlas_offset_x = slot_x * TILE_RESOLUTION;
             let atlas_offset_y = slot_y * TILE_RESOLUTION;
+
+            // Road ID atlas texel offset
+            let road_id_atlas_offset_x = slot_x * ROAD_ID_RESOLUTION;
+            let road_id_atlas_offset_y = slot_y * ROAD_ID_RESOLUTION;
 
             let (wx, wy) = key.world_origin();
 
@@ -586,7 +723,10 @@ impl SdfTileManager {
                 tile_size: TILE_SIZE,
                 tile_resolution: TILE_RESOLUTION,
                 tile_index: info.header_index,
-                _pad: 0,
+                road_id_atlas_offset_x,
+                road_id_atlas_offset_y,
+                road_id_resolution: ROAD_ID_RESOLUTION,
+                _pad: [0; 2],
             };
 
             unsafe {
@@ -610,8 +750,465 @@ impl SdfTileManager {
         !self.dirty_tiles.is_empty()
     }
 
+    /// Check if the cache load queue is active and may have pending uploads.
+    pub fn load_queue_active(&self) -> bool {
+        self.load_queue.is_some() && !self.loading_tiles.is_empty()
+    }
+
+    /// Invalidate tiles in the disk cache whose road data has changed.
+    /// Call this after `tile_map.rebuild()` with the returned set of changed keys.
+    pub fn invalidate_cached_tiles(&mut self, changed: &HashSet<TileKey>) {
+        if changed.is_empty() {
+            return;
+        }
+        if let Some(cache) = &mut self.cache {
+            for &key in changed {
+                if let Err(e) = cache.invalidate_tile(key) {
+                    log::warn!("failed to invalidate cache tile {:?}: {}", key, e);
+                }
+            }
+            log::info!("Invalidated {} tile(s) in disk cache", changed.len());
+        }
+    }
+
+    /// Open a disk cache file and spawn the background I/O thread.
+    pub fn open_cache(
+        &mut self,
+        cache_path: &Path,
+        allocator: &vma::Allocator,
+    ) -> anyhow::Result<()> {
+        let cache = SdfCacheFile::open(cache_path)
+            .map_err(|e| anyhow::anyhow!("failed to open tile cache: {}", e))?;
+        let load_queue = TileLoadQueue::new(cache_path)
+            .map_err(|e| anyhow::anyhow!("failed to start tile I/O thread: {}", e))?;
+
+        // Create a staging buffer large enough for one tile (SDF + road_id)
+        let sdf_bytes = (TILE_RESOLUTION * TILE_RESOLUTION * 4) as u64; // RG16F
+        let rid_bytes = (ROAD_ID_RESOLUTION * ROAD_ID_RESOLUTION * 2) as u64; // R16_SFLOAT
+        let staging_size = sdf_bytes + rid_bytes;
+        let (staging, ptr) = GpuBuffer::new_mapped(
+            allocator,
+            staging_size * 16, // room for 16 uploads per frame
+            vk::BufferUsageFlags::TRANSFER_SRC,
+        )?;
+
+        self.cache = Some(cache);
+        self.load_queue = Some(load_queue);
+        self.staging_buffer = Some(staging);
+        self.staging_ptr = ptr;
+        Ok(())
+    }
+
+    /// Process completed tile loads from the I/O thread and upload to GPU.
+    /// Must be called during command buffer recording with both atlas images in
+    /// GENERAL layout. Returns the number of tiles uploaded.
+    pub fn upload_cached_tiles(&mut self, device: &Device, cmd: vk::CommandBuffer) -> u32 {
+        let load_queue = match self.load_queue.as_mut() {
+            Some(q) => q,
+            None => return 0,
+        };
+
+        let results = load_queue.drain_completed(16);
+        if results.is_empty() {
+            return 0;
+        }
+
+        let sdf_tile_bytes = (TILE_RESOLUTION * TILE_RESOLUTION * 4) as usize;
+        let rid_tile_bytes = (ROAD_ID_RESOLUTION * ROAD_ID_RESOLUTION * 2) as usize;
+        let per_tile = sdf_tile_bytes + rid_tile_bytes;
+        let mut count = 0u32;
+
+        for (i, result) in results.into_iter().enumerate() {
+            self.loading_tiles.remove(&result.key);
+
+            // Verify the tile still occupies the expected slot
+            if self.tile_to_slot.get(&result.key) != Some(&result.slot) {
+                continue;
+            }
+
+            // Copy pixel data to staging buffer
+            let staging_offset = i * per_tile;
+            unsafe {
+                let dst = self.staging_ptr.add(staging_offset);
+                std::ptr::copy_nonoverlapping(result.data.sdf_pixels.as_ptr(), dst, sdf_tile_bytes);
+                std::ptr::copy_nonoverlapping(
+                    result.data.road_id_pixels.as_ptr(),
+                    dst.add(sdf_tile_bytes),
+                    rid_tile_bytes,
+                );
+            }
+
+            let slot_x = result.slot % self.atlas_tiles_dim;
+            let slot_y = result.slot / self.atlas_tiles_dim;
+
+            // Copy SDF data: staging → sdf_atlas
+            let sdf_region = vk::BufferImageCopy::builder()
+                .buffer_offset(staging_offset as u64)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::builder()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1)
+                        .build(),
+                )
+                .image_offset(vk::Offset3D {
+                    x: (slot_x * TILE_RESOLUTION) as i32,
+                    y: (slot_y * TILE_RESOLUTION) as i32,
+                    z: 0,
+                })
+                .image_extent(vk::Extent3D {
+                    width: TILE_RESOLUTION,
+                    height: TILE_RESOLUTION,
+                    depth: 1,
+                })
+                .build();
+
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    cmd,
+                    self.staging_buffer.as_ref().unwrap().buffer,
+                    self.sdf_atlas.image,
+                    vk::ImageLayout::GENERAL,
+                    &[sdf_region],
+                );
+            }
+
+            // Copy road_id data: staging → road_id_atlas
+            let rid_region = vk::BufferImageCopy::builder()
+                .buffer_offset((staging_offset + sdf_tile_bytes) as u64)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::builder()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1)
+                        .build(),
+                )
+                .image_offset(vk::Offset3D {
+                    x: (slot_x * ROAD_ID_RESOLUTION) as i32,
+                    y: (slot_y * ROAD_ID_RESOLUTION) as i32,
+                    z: 0,
+                })
+                .image_extent(vk::Extent3D {
+                    width: ROAD_ID_RESOLUTION,
+                    height: ROAD_ID_RESOLUTION,
+                    depth: 1,
+                })
+                .build();
+
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    cmd,
+                    self.staging_buffer.as_ref().unwrap().buffer,
+                    self.road_id_atlas.image,
+                    vk::ImageLayout::GENERAL,
+                    &[rid_region],
+                );
+            }
+
+            self.tiles_changed = true;
+            count += 1;
+        }
+        count
+    }
+
+    /// Generate all tiles with road segments and write them to a disk cache.
+    ///
+    /// Batches tiles into atlas-sized groups (up to `atlas_tiles_dim²` per batch),
+    /// dispatches the SDF compute shader, reads the result back to CPU, and
+    /// compresses each tile into the cache file.
+    ///
+    /// Both atlas images are left in UNDEFINED layout after this call.
+    /// Returns the total number of tiles written.
+    pub fn pregenerate_to_cache(
+        &mut self,
+        device: &Arc<Device>,
+        allocator: &vma::Allocator,
+        queue: vk::Queue,
+        queue_family: u32,
+        cache_path: &Path,
+        world_origin: (f32, f32),
+        world_size: (f32, f32),
+    ) -> anyhow::Result<u32> {
+        use crate::tile_cache::SdfCacheFile;
+
+        let mut cache = SdfCacheFile::create(
+            cache_path,
+            world_origin,
+            world_size,
+            TILE_SIZE,
+            TILE_RESOLUTION,
+            ROAD_ID_RESOLUTION,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to create tile cache: {}", e))?;
+
+        let all_keys: Vec<TileKey> = self.tile_map.tiles.keys().cloned().collect();
+        if all_keys.is_empty() {
+            log::info!("No tiles to pregenerate");
+            return Ok(0);
+        }
+
+        let total_slots = (self.atlas_tiles_dim * self.atlas_tiles_dim) as usize;
+
+        // Readback buffers for the full atlas
+        let sdf_atlas_px = (self.atlas_tiles_dim * TILE_RESOLUTION) as usize;
+        let sdf_readback_bytes = (sdf_atlas_px * sdf_atlas_px * 4) as u64;
+        let (sdf_rb, sdf_rb_ptr) = GpuBuffer::new_mapped(
+            allocator,
+            sdf_readback_bytes,
+            vk::BufferUsageFlags::TRANSFER_DST,
+        )?;
+
+        let rid_atlas_px = (self.atlas_tiles_dim * ROAD_ID_RESOLUTION) as usize;
+        let rid_readback_bytes = (rid_atlas_px * rid_atlas_px * 2) as u64;
+        let (rid_rb, rid_rb_ptr) = GpuBuffer::new_mapped(
+            allocator,
+            rid_readback_bytes,
+            vk::BufferUsageFlags::TRANSFER_DST,
+        )?;
+
+        // One-shot command pool + fence
+        let pool_info = vk::CommandPoolCreateInfo::builder()
+            .queue_family_index(queue_family)
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+        let cmd_pool = unsafe { device.create_command_pool(&pool_info, None)? };
+        let alloc_info = vk::CommandBufferAllocateInfo::builder()
+            .command_pool(cmd_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = unsafe { device.allocate_command_buffers(&alloc_info)?[0] };
+        let fence_info = vk::FenceCreateInfo::default();
+        let fence = unsafe { device.create_fence(&fence_info, None)? };
+
+        let mut total_written = 0u32;
+        let num_batches = (all_keys.len() + total_slots - 1) / total_slots;
+
+        for (batch_idx, chunk) in all_keys.chunks(total_slots).enumerate() {
+            log::info!(
+                "Pregenerating batch {}/{} ({} tiles)",
+                batch_idx + 1,
+                num_batches,
+                chunk.len()
+            );
+
+            // Assign tiles to atlas slots
+            self.clear_slots();
+            for (i, &key) in chunk.iter().enumerate() {
+                let slot = i as u32;
+                self.slot_to_tile[slot as usize] = Some(key);
+                self.tile_to_slot.insert(key, slot);
+                self.dirty_tiles.insert(key);
+            }
+
+            // Record command buffer
+            unsafe {
+                device.reset_command_pool(cmd_pool, vk::CommandPoolResetFlags::empty())?;
+                device.begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::builder()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )?;
+            }
+
+            crate::transition_image(
+                device,
+                cmd,
+                self.sdf_atlas.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+            );
+            crate::transition_image(
+                device,
+                cmd,
+                self.road_id_atlas.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+            );
+
+            self.dispatch_dirty_tiles(device, cmd);
+
+            // Barrier: compute writes → transfer reads
+            unsafe {
+                let barrier = vk::MemoryBarrier2::builder()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ);
+                let dep =
+                    vk::DependencyInfo::builder().memory_barriers(std::slice::from_ref(&barrier));
+                device.cmd_pipeline_barrier2(cmd, &dep);
+            }
+
+            crate::transition_image(
+                device,
+                cmd,
+                self.sdf_atlas.image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            crate::transition_image(
+                device,
+                cmd,
+                self.road_id_atlas.image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+
+            // Copy atlas images → readback buffers
+            let sdf_copy = vk::BufferImageCopy::builder()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::builder()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1)
+                        .build(),
+                )
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width: sdf_atlas_px as u32,
+                    height: sdf_atlas_px as u32,
+                    depth: 1,
+                })
+                .build();
+            unsafe {
+                device.cmd_copy_image_to_buffer(
+                    cmd,
+                    self.sdf_atlas.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    sdf_rb.buffer,
+                    &[sdf_copy],
+                );
+            }
+
+            let rid_copy = vk::BufferImageCopy::builder()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::builder()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1)
+                        .build(),
+                )
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width: rid_atlas_px as u32,
+                    height: rid_atlas_px as u32,
+                    depth: 1,
+                })
+                .build();
+            unsafe {
+                device.cmd_copy_image_to_buffer(
+                    cmd,
+                    self.road_id_atlas.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    rid_rb.buffer,
+                    &[rid_copy],
+                );
+            }
+
+            // Submit and wait
+            unsafe {
+                device.end_command_buffer(cmd)?;
+                let cmd_info = vk::CommandBufferSubmitInfo::builder()
+                    .command_buffer(cmd)
+                    .build();
+                let submit = vk::SubmitInfo2::builder()
+                    .command_buffer_infos(std::slice::from_ref(&cmd_info));
+                device.queue_submit2(queue, std::slice::from_ref(&submit), fence)?;
+                device.wait_for_fences(&[fence], true, u64::MAX)?;
+                device.reset_fences(&[fence])?;
+            }
+
+            // Extract per-tile pixel data and write to cache
+            let sdf_bpp = 4usize; // RG16F = 4 bytes/pixel
+            let rid_bpp = 2usize; // R16_SFLOAT = 2 bytes/pixel
+            let sdf_row_pitch = sdf_atlas_px * sdf_bpp;
+            let rid_row_pitch = rid_atlas_px * rid_bpp;
+
+            for (i, &key) in chunk.iter().enumerate() {
+                let slot = i as u32;
+                let slot_x = slot % self.atlas_tiles_dim;
+                let slot_y = slot / self.atlas_tiles_dim;
+
+                // Extract SDF tile
+                let sdf_tile_row = (TILE_RESOLUTION as usize) * sdf_bpp;
+                let mut sdf_data =
+                    vec![0u8; (TILE_RESOLUTION * TILE_RESOLUTION) as usize * sdf_bpp];
+                let sdf_origin_x = (slot_x * TILE_RESOLUTION) as usize;
+                let sdf_origin_y = (slot_y * TILE_RESOLUTION) as usize;
+                for row in 0..TILE_RESOLUTION as usize {
+                    let src = (sdf_origin_y + row) * sdf_row_pitch + sdf_origin_x * sdf_bpp;
+                    let dst = row * sdf_tile_row;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            sdf_rb_ptr.add(src),
+                            sdf_data.as_mut_ptr().add(dst),
+                            sdf_tile_row,
+                        );
+                    }
+                }
+
+                // Extract road_id tile
+                let rid_tile_row = (ROAD_ID_RESOLUTION as usize) * rid_bpp;
+                let mut rid_data =
+                    vec![0u8; (ROAD_ID_RESOLUTION * ROAD_ID_RESOLUTION) as usize * rid_bpp];
+                let rid_origin_x = (slot_x * ROAD_ID_RESOLUTION) as usize;
+                let rid_origin_y = (slot_y * ROAD_ID_RESOLUTION) as usize;
+                for row in 0..ROAD_ID_RESOLUTION as usize {
+                    let src = (rid_origin_y + row) * rid_row_pitch + rid_origin_x * rid_bpp;
+                    let dst = row * rid_tile_row;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            rid_rb_ptr.add(src),
+                            rid_data.as_mut_ptr().add(dst),
+                            rid_tile_row,
+                        );
+                    }
+                }
+
+                cache
+                    .write_tile(key, &sdf_data, &rid_data)
+                    .map_err(|e| anyhow::anyhow!("cache write error: {}", e))?;
+                total_written += 1;
+            }
+        }
+
+        // Cleanup
+        self.clear_slots();
+        unsafe {
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(cmd_pool, None);
+        }
+        sdf_rb.destroy(allocator);
+        rid_rb.destroy(allocator);
+
+        log::info!("Pregenerated {} tiles to {:?}", total_written, cache_path);
+        Ok(total_written)
+    }
+
     /// Destroy all GPU resources.
     pub fn destroy(&mut self, device: &Device, allocator: &vma::Allocator) {
+        // Shut down I/O thread first
+        if let Some(mut lq) = self.load_queue.take() {
+            lq.shutdown();
+        }
+        self.cache = None;
+
+        if let Some(b) = self.staging_buffer.take() {
+            b.destroy(allocator);
+        }
         if let Some(b) = self.tile_header_buffer.take() {
             b.destroy(allocator);
         }
@@ -621,7 +1218,8 @@ impl SdfTileManager {
         if let Some(b) = self.tile_road_index_buffer.take() {
             b.destroy(allocator);
         }
-        self.atlas.destroy(device, allocator);
+        self.sdf_atlas.destroy(device, allocator);
+        self.road_id_atlas.destroy(device, allocator);
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);

@@ -4,7 +4,7 @@ mod traffic_sim;
 
 use std::path::PathBuf;
 
-use engine::frustum_cull::{camera_world_bounds, CarCullPass, TileCullPass};
+use engine::frustum_cull::{CarCullPass, TileCullPass, camera_world_bounds};
 use engine::gpu_resources::GpuBuffer;
 use engine::pipeline::{
     GraphicsPipelineDesc, allocate_descriptor_set, create_compute_pipeline,
@@ -114,6 +114,7 @@ struct TrafficApp {
     road_render_descriptor_pool: vk::DescriptorPool,
     road_render_descriptor_set: vk::DescriptorSet,
     road_render_sampler: vk::Sampler,
+    road_id_sampler: vk::Sampler,
     road_render_descriptors_valid: bool,
 
     // Traffic simulation
@@ -125,6 +126,11 @@ struct TrafficApp {
 
     // Scenario-based car placement (overrides random init when Some)
     scenario_cars: Option<Vec<scenario::ScenarioCar>>,
+
+    // SDF cache path — if set, open cache on init and pregenerate on first dirty
+    sdf_cache_path: Option<PathBuf>,
+    /// Set to true after pregeneration has been triggered (one-shot).
+    pregenerate_done: bool,
 
     // Simulation speed multiplier (0 = paused, 0.5, 1.0, 2.0, 4.0)
     sim_speed: f32,
@@ -168,6 +174,7 @@ impl Default for TrafficApp {
             road_render_descriptor_pool: vk::DescriptorPool::null(),
             road_render_descriptor_set: vk::DescriptorSet::null(),
             road_render_sampler: vk::Sampler::null(),
+            road_id_sampler: vk::Sampler::null(),
             road_render_descriptors_valid: false,
 
             traffic: TrafficSim::default(),
@@ -176,6 +183,9 @@ impl Default for TrafficApp {
             tile_cull: None,
 
             scenario_cars: None,
+
+            sdf_cache_path: None,
+            pregenerate_done: false,
 
             sim_speed: 1.0,
             fps_accumulator: 0.0,
@@ -308,6 +318,14 @@ impl TrafficApp {
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE);
         self.road_render_sampler = unsafe { device.create_sampler(&sampler_info, None)? };
 
+        // Nearest sampler for road_id atlas (no interpolation for discrete IDs)
+        let nearest_sampler_info = vk::SamplerCreateInfo::builder()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        self.road_id_sampler = unsafe { device.create_sampler(&nearest_sampler_info, None)? };
+
         let bindings = [
             vk::DescriptorSetLayoutBinding::builder()
                 .binding(0)
@@ -346,17 +364,31 @@ impl TrafficApp {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::VERTEX)
                 .build(),
+            // binding 6: road_id sampled image (R16_SFLOAT, nearest)
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+            // binding 7: nearest sampler for road_id atlas
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(7)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
         ];
         self.road_render_descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
 
         let pool_sizes = [
             vk::DescriptorPoolSize::builder()
                 .type_(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(1)
+                .descriptor_count(2) // SDF atlas + road_id atlas
                 .build(),
             vk::DescriptorPoolSize::builder()
                 .type_(vk::DescriptorType::SAMPLER)
-                .descriptor_count(1)
+                .descriptor_count(2) // linear + nearest
                 .build(),
             vk::DescriptorPoolSize::builder()
                 .type_(vk::DescriptorType::STORAGE_BUFFER)
@@ -377,11 +409,18 @@ impl TrafficApp {
 
         // Write atlas image + sampler descriptors (constant)
         let image_info = [vk::DescriptorImageInfo::builder()
-            .image_view(sdf_manager.atlas.view)
+            .image_view(sdf_manager.sdf_atlas.view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .build()];
         let sampler_info_desc = [vk::DescriptorImageInfo::builder()
             .sampler(self.road_render_sampler)
+            .build()];
+        let road_id_image_info = [vk::DescriptorImageInfo::builder()
+            .image_view(sdf_manager.road_id_atlas.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .build()];
+        let road_id_sampler_info = [vk::DescriptorImageInfo::builder()
+            .sampler(self.road_id_sampler)
             .build()];
         let writes = [
             vk::WriteDescriptorSet::builder()
@@ -397,6 +436,20 @@ impl TrafficApp {
                 .dst_array_element(0)
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .image_info(&sampler_info_desc)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(self.road_render_descriptor_set)
+                .dst_binding(6)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&road_id_image_info)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(self.road_render_descriptor_set)
+                .dst_binding(7)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&road_id_sampler_info)
                 .build(),
         ];
         unsafe {
@@ -534,7 +587,10 @@ impl TrafficApp {
         }
 
         let aabbs = compute_segment_aabbs(&seg_infos);
-        sdf.tile_map.rebuild(&aabbs);
+        let changed = sdf.tile_map.rebuild(&aabbs);
+
+        // Invalidate stale tiles in the disk cache
+        sdf.invalidate_cached_tiles(&changed);
 
         if let Some(seg_buf) = &self.gpu_road_data.segment_buffer {
             sdf.upload_tile_data(
@@ -653,6 +709,41 @@ impl TrafficApp {
             self.gpu_road_data.road_lane_counts_buf.as_ref(),
             visible_indices_buf,
         );
+
+        // Pregenerate SDF tiles to disk cache if requested
+        if let Some(cache_path) = &self.sdf_cache_path {
+            if !self.pregenerate_done {
+                if let Some(sdf) = &mut self.sdf_manager {
+                    // Compute world AABB from all tile keys
+                    let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+                    let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+                    for key in sdf.tile_map.tiles.keys() {
+                        let (ox, oy) = key.world_origin();
+                        min_x = min_x.min(ox);
+                        min_y = min_y.min(oy);
+                        max_x = max_x.max(ox + engine::sdf::TILE_SIZE);
+                        max_y = max_y.max(oy + engine::sdf::TILE_SIZE);
+                    }
+                    let world_origin = (min_x, min_y);
+                    let world_size = (max_x - min_x, max_y - min_y);
+
+                    let path = cache_path.clone();
+                    sdf.pregenerate_to_cache(
+                        ctx.device,
+                        ctx.allocator,
+                        ctx.graphics_queue,
+                        ctx.graphics_queue_family,
+                        &path,
+                        world_origin,
+                        world_size,
+                    )?;
+
+                    // Open the freshly-written cache for streaming
+                    sdf.open_cache(&path, ctx.allocator)?;
+                }
+                self.pregenerate_done = true;
+            }
+        }
 
         self.dirty = false;
         Ok(())
@@ -876,7 +967,9 @@ impl TrafficApp {
         sdf.tiles_changed = false;
 
         // Wait for GPU to finish using the old buffers/descriptors
-        unsafe { ctx.device.device_wait_idle()?; }
+        unsafe {
+            ctx.device.device_wait_idle()?;
+        }
 
         // Re-upload tile instances for the frustum cull pass
         if let Some(tc) = &mut self.tile_cull {
@@ -895,24 +988,47 @@ impl TrafficApp {
             Some(s) => s,
             None => return,
         };
-        if !sdf.has_dirty_tiles() {
+
+        let has_dirty = sdf.has_dirty_tiles();
+        let has_cache = sdf.load_queue_active();
+
+        if !has_dirty && !has_cache {
             return;
         }
+
+        // Use tracked layout as source — UNDEFINED on first call (discards garbage),
+        // SHADER_READ_ONLY_OPTIMAL on subsequent calls (preserves existing tile data).
+        let old_layout = sdf.atlas_layout;
 
         transition_image(
             device,
             cmd,
-            sdf.atlas.image,
-            vk::ImageLayout::UNDEFINED,
+            sdf.sdf_atlas.image,
+            old_layout,
+            vk::ImageLayout::GENERAL,
+        );
+        transition_image(
+            device,
+            cmd,
+            sdf.road_id_atlas.image,
+            old_layout,
             vk::ImageLayout::GENERAL,
         );
 
-        sdf.dispatch_dirty_tiles(device, cmd);
+        // GPU-generate dirty tiles
+        if has_dirty {
+            sdf.dispatch_dirty_tiles(device, cmd);
+        }
+
+        // Upload cached tiles from disk I/O thread
+        sdf.upload_cached_tiles(device, cmd);
 
         unsafe {
             let barrier = vk::MemoryBarrier2::builder()
-                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::ALL_TRANSFER,
+                )
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_READ);
             let dep = vk::DependencyInfo::builder().memory_barriers(std::slice::from_ref(&barrier));
@@ -922,10 +1038,19 @@ impl TrafficApp {
         transition_image(
             device,
             cmd,
-            sdf.atlas.image,
+            sdf.sdf_atlas.image,
             vk::ImageLayout::GENERAL,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         );
+        transition_image(
+            device,
+            cmd,
+            sdf.road_id_atlas.image,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        sdf.atlas_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
 
     fn dispatch_grid(&self, ctx: &EngineContext, cmd: vk::CommandBuffer) {
@@ -1019,13 +1144,7 @@ impl TrafficApp {
 
         // Car frustum cull
         if let Some(car_cull) = &self.car_cull {
-            car_cull.dispatch(
-                device,
-                cmd,
-                self.traffic.car_count,
-                ctx.camera,
-                aspect,
-            );
+            car_cull.dispatch(device, cmd, self.traffic.car_count, ctx.camera, aspect);
         }
 
         // Tile frustum cull
@@ -1320,6 +1439,7 @@ impl App for TrafficApp {
             ctx.device
                 .destroy_descriptor_set_layout(self.road_render_descriptor_set_layout, None);
             ctx.device.destroy_sampler(self.road_render_sampler, None);
+            ctx.device.destroy_sampler(self.road_id_sampler, None);
         }
         if let Some(b) = self.polyline_buffer.take() {
             b.destroy(ctx.allocator);
@@ -1364,6 +1484,14 @@ fn main() -> anyhow::Result<()> {
         app.network = network;
         app.scenario_cars = Some(scenario.cars);
         app.dirty = true;
+    }
+
+    // Parse --pregenerate-sdf <path> argument
+    if let Some(pos) = args.iter().position(|a| a == "--pregenerate-sdf") {
+        let path = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--pregenerate-sdf requires a file path"))?;
+        app.sdf_cache_path = Some(PathBuf::from(path));
     }
 
     engine::run(app)

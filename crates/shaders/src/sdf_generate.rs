@@ -14,7 +14,10 @@ pub struct SdfPushConstants {
     pub tile_size: f32,
     pub tile_resolution: u32,
     pub tile_index: u32,
-    pub _pad: u32,
+    pub road_id_atlas_offset_x: u32,
+    pub road_id_atlas_offset_y: u32,
+    pub road_id_resolution: u32,
+    pub _pad: [u32; 2],
 }
 
 #[spirv(compute(threads(16, 16)))]
@@ -26,6 +29,7 @@ pub fn sdf_generate_main(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] tile_headers: &[TileHeader],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] tile_segment_indices: &[u32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] road_indices: &[u32],
+    #[spirv(descriptor_set = 0, binding = 5)] road_id_atlas: &StorageImage2d,
 ) {
     if id.x >= pc.tile_resolution || id.y >= pc.tile_resolution {
         return;
@@ -70,16 +74,35 @@ pub fn sdf_generate_main(
         i += 1;
     }
 
-    let s_mod = best_s % 6.0;
+    // Clamp road_id to -1 for texels far from any road to prevent
+    // stray fragments at tile boundaries and road endpoints.
+    // 20m is wider than any road + shoulder so legitimate road texels are unaffected.
+    if min_dist > 20.0 {
+        best_road = -1.0;
+    }
+
+    // Write SDF atlas (RG16F): signed_dist, s_coord
     let atlas_pos = IVec2::new(
         (pc.atlas_offset_x + id.x) as i32,
         (pc.atlas_offset_y + id.y) as i32,
     );
 
     unsafe {
-        sdf_atlas.write(
-            atlas_pos,
-            Vec4::new(best_signed_dist, best_s, best_road, s_mod),
+        sdf_atlas.write(atlas_pos, Vec4::new(best_signed_dist, best_s, 0.0, 0.0));
+    }
+
+    // Write road ID atlas (R16_SFLOAT) at lower resolution (every Nth texel)
+    // Map SDF texel to road_id texel: road_id covers same world area at lower res
+    let ratio = pc.tile_resolution / pc.road_id_resolution;
+    if id.x % ratio == 0 && id.y % ratio == 0 {
+        let rid_x = id.x / ratio;
+        let rid_y = id.y / ratio;
+        let road_id_pos = IVec2::new(
+            (pc.road_id_atlas_offset_x + rid_x) as i32,
+            (pc.road_id_atlas_offset_y + rid_y) as i32,
         );
+        unsafe {
+            road_id_atlas.write(road_id_pos, Vec4::new(best_road, 0.0, 0.0, 0.0));
+        }
     }
 }

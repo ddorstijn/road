@@ -10,7 +10,7 @@ use vulkanalia_vma as vma;
 use crate::camera::Camera2D;
 use crate::gpu_resources::GpuBuffer;
 use crate::pipeline::{write_storage_buffers, ComputePass};
-use crate::sdf::{SdfTileManager, TILE_RESOLUTION, TILE_SIZE};
+use crate::sdf::{SdfTileManager, ROAD_ID_RESOLUTION, TILE_RESOLUTION, TILE_SIZE};
 
 use gpu_shared::{DrawIndirectCommand, GpuTileInstance};
 
@@ -329,13 +329,23 @@ impl TileCullPass {
         let atlas_size_f = (atlas_tiles * TILE_RESOLUTION) as f32;
         let half_texel = 0.5 / atlas_size_f;
 
+        let road_id_atlas_size_f = (atlas_tiles * ROAD_ID_RESOLUTION) as f32;
+        let road_id_half_texel = 0.5 / road_id_atlas_size_f;
+
         let mut instances = Vec::with_capacity(tile_count);
         for (key, &slot) in &sdf.tile_to_slot {
             let slot_x = slot % atlas_tiles;
             let slot_y = slot / atlas_tiles;
+
+            // SDF atlas UVs
             let uv_offset_x = (slot_x * TILE_RESOLUTION) as f32 / atlas_size_f + half_texel;
             let uv_offset_y = (slot_y * TILE_RESOLUTION) as f32 / atlas_size_f + half_texel;
             let uv_scale = TILE_RESOLUTION as f32 / atlas_size_f - 2.0 * half_texel;
+
+            // Road ID atlas UVs
+            let rid_uv_offset_x = (slot_x * ROAD_ID_RESOLUTION) as f32 / road_id_atlas_size_f + road_id_half_texel;
+            let rid_uv_offset_y = (slot_y * ROAD_ID_RESOLUTION) as f32 / road_id_atlas_size_f + road_id_half_texel;
+            let rid_uv_scale = ROAD_ID_RESOLUTION as f32 / road_id_atlas_size_f - 2.0 * road_id_half_texel;
 
             let (wx, wy) = key.world_origin();
 
@@ -344,6 +354,8 @@ impl TileCullPass {
                 atlas_uv_scale: [uv_scale, uv_scale],
                 tile_world_origin: [wx, wy],
                 tile_world_size: [TILE_SIZE, TILE_SIZE],
+                road_id_uv_offset: [rid_uv_offset_x, rid_uv_offset_y],
+                road_id_uv_scale: [rid_uv_scale, rid_uv_scale],
             });
         }
 
