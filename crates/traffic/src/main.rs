@@ -4,9 +4,7 @@ mod traffic_sim;
 
 use std::path::PathBuf;
 
-use engine::gpu_pipeline_stats::GpuPipelineStats;
 use engine::gpu_resources::GpuBuffer;
-use engine::gpu_timestamps::GpuTimestamps;
 use engine::pipeline::{
     GraphicsPipelineDesc, allocate_descriptor_set, create_compute_pipeline,
     create_descriptor_set_layout, create_graphics_pipeline, write_storage_buffers,
@@ -136,10 +134,6 @@ struct TrafficApp {
     fps_accumulator: f32,
     fps_frame_count: u32,
     fps_display: f32,
-
-    // GPU timestamp profiling
-    gpu_timestamps: Option<GpuTimestamps>,
-    gpu_pipeline_stats: Option<GpuPipelineStats>,
 }
 
 impl Default for TrafficApp {
@@ -185,8 +179,6 @@ impl Default for TrafficApp {
             fps_accumulator: 0.0,
             fps_frame_count: 0,
             fps_display: 0.0,
-            gpu_timestamps: None,
-            gpu_pipeline_stats: None,
         }
     }
 }
@@ -788,9 +780,6 @@ impl TrafficApp {
 // Render sub-phases
 // ---------------------------------------------------------------------------
 
-/// GPU timestamp phase names (order must match write_phase calls in render()).
-const GPU_PHASE_NAMES: &[&str] = &["sdf", "grid", "sort", "idm", "mobil", "draw"];
-
 impl TrafficApp {
     fn dispatch_sdf(&mut self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
         let sdf = match self.sdf_manager.as_mut() {
@@ -880,33 +869,17 @@ impl TrafficApp {
             self.traffic.sim_tick += 1;
             ticks_this_frame += 1;
 
-            // Only timestamp the first tick per frame to stay within query pool bounds
-            let stamp = ticks_this_frame == 1;
-
             // Sort (keys + radix sort)
             self.traffic.dispatch_sort(device, cmd);
-            if stamp {
-                if let Some(ts) = &mut self.gpu_timestamps {
-                    ts.write_phase(device, cmd);
-                }
-            }
 
             // IDM car-following
+            #[cfg(feature = "idm")]
             self.traffic.dispatch_idm(device, cmd);
-            if stamp {
-                if let Some(ts) = &mut self.gpu_timestamps {
-                    ts.write_phase(device, cmd);
-                }
-            }
 
-            // MOBIL lane change (disabled for testing)
-            //if self.traffic.should_lane_change() {
-            //    self.traffic.dispatch_lane_change(device, cmd);
-            //}
-            if stamp {
-                if let Some(ts) = &mut self.gpu_timestamps {
-                    ts.write_phase(device, cmd);
-                }
+            // MOBIL lane change
+            #[cfg(feature = "mobil")]
+            if self.traffic.should_lane_change() {
+                self.traffic.dispatch_lane_change(device, cmd);
             }
         }
 
@@ -1112,19 +1085,9 @@ impl TrafficApp {
             } else {
                 format!("{:.1}x", self.sim_speed)
             };
-            let gpu_info = if let Some(ts) = &self.gpu_timestamps {
-                format!(" | GPU: {}", ts.format_phases())
-            } else {
-                String::new()
-            };
-            let stats_info = if let Some(ps) = &self.gpu_pipeline_stats {
-                format!(" | {}", ps.format())
-            } else {
-                String::new()
-            };
             window.set_title(&format!(
-                "Traffic Sim | {:.0} FPS | {} cars | {}{}{} | [Space]=pause [1-4]=speed",
-                self.fps_display, self.traffic.car_count, speed_label, gpu_info, stats_info,
+                "Traffic Sim | {:.0} FPS | {} cars | {} | [Space]=pause [1-4]=speed",
+                self.fps_display, self.traffic.car_count, speed_label,
             ));
         }
     }
@@ -1166,12 +1129,6 @@ impl App for TrafficApp {
         self.create_line_pipeline(ctx)?;
         self.create_sdf_system(ctx)?;
         self.traffic.create_pipelines(ctx)?;
-        self.gpu_timestamps = Some(GpuTimestamps::new(
-            ctx.device.as_ref(),
-            ctx.timestamp_period,
-            GPU_PHASE_NAMES,
-        )?);
-        self.gpu_pipeline_stats = Some(GpuPipelineStats::new(ctx.device.as_ref())?);
 
         // If a scenario was loaded before init, mark dirty to trigger road upload + car init
         if !self.network.roads.is_empty() {
@@ -1189,16 +1146,6 @@ impl App for TrafficApp {
     fn render(&mut self, ctx: &EngineContext, cmd: vk::CommandBuffer) -> anyhow::Result<()> {
         let device = ctx.device.as_ref();
 
-        // Read previous frame's GPU timestamps, begin new frame
-        if let Some(ts) = &mut self.gpu_timestamps {
-            ts.read_results(device);
-            ts.reset_and_begin(device, cmd);
-        }
-        if let Some(ps) = &mut self.gpu_pipeline_stats {
-            ps.read_results(device);
-            ps.begin(device, cmd);
-        }
-
         // Input & dirty road handling
         let needs_rebuild = self.process_input(ctx);
         if needs_rebuild {
@@ -1208,29 +1155,15 @@ impl App for TrafficApp {
 
         // Phase: SDF tile generation
         self.dispatch_sdf(device, cmd);
-        if let Some(ts) = &mut self.gpu_timestamps {
-            ts.write_phase(device, cmd);
-        }
 
         // Phase: Grid background
         self.dispatch_grid(ctx, cmd);
-        if let Some(ts) = &mut self.gpu_timestamps {
-            ts.write_phase(device, cmd);
-        }
 
         // Phase: Traffic simulation (sort → IDM → MOBIL) — writes sub-phase timestamps internally
         self.dispatch_traffic(device, cmd, ctx.dt);
 
         // Phase: Scene rendering (roads, polylines, cars)
         self.draw_scene(ctx, cmd);
-        if let Some(ts) = &mut self.gpu_timestamps {
-            ts.write_phase(device, cmd);
-        }
-
-        // End pipeline stats query before HUD
-        if let Some(ps) = &self.gpu_pipeline_stats {
-            ps.end(device, cmd);
-        }
 
         // HUD
         self.update_hud(ctx);
@@ -1270,12 +1203,6 @@ impl App for TrafficApp {
             sdf.destroy(ctx.device.as_ref(), ctx.allocator);
         }
         self.traffic.destroy(ctx.device.as_ref(), ctx.allocator);
-        if let Some(ts) = self.gpu_timestamps.take() {
-            ts.destroy(ctx.device.as_ref());
-        }
-        if let Some(ps) = self.gpu_pipeline_stats.take() {
-            ps.destroy(ctx.device.as_ref());
-        }
         // Save and destroy Vulkan pipeline cache
         engine::destroy_pipeline_cache(ctx.device.as_ref());
     }
