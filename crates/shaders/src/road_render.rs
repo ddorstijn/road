@@ -81,7 +81,10 @@ pub fn fs_main(
     // Compute s_mod_period inline (was channel A, removed to avoid wrapping discontinuity)
     let s_mod_period = s_coord % 6.0;
 
-    if road_id_f < 0.0 {
+    // Guard against negative, NaN, and out-of-range road IDs.
+    // NaN fails all comparisons, so check with !(x >= 0.0) to catch it.
+    // 255.0 is a safe upper bound since road_id fits in 8 bits of sort key.
+    if !(road_id_f >= 0.0 && road_id_f < 255.0) {
         spirv_std::arch::kill();
     }
 
