@@ -1,8 +1,8 @@
 use crate::road_eval::{closest_point_on_segment, world_to_segment_local};
 use gpu_shared::{GpuSegment, TileHeader};
-use spirv_std::glam::{IVec2, UVec3, Vec2, Vec4};
-use spirv_std::image::StorageImage2d;
+use spirv_std::glam::{IVec2, UVec3, Vec2};
 use spirv_std::spirv;
+use spirv_std::Image;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -24,12 +24,20 @@ pub struct SdfPushConstants {
 pub fn sdf_generate_main(
     #[spirv(global_invocation_id)] id: UVec3,
     #[spirv(push_constant)] pc: &SdfPushConstants,
-    #[spirv(descriptor_set = 0, binding = 0)] sdf_atlas: &StorageImage2d,
+    #[spirv(descriptor_set = 0, binding = 0)] sdf_atlas: &Image!(
+        2D,
+        format = rg16f,
+        sampled = false
+    ),
     #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] segments: &[GpuSegment],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] tile_headers: &[TileHeader],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] tile_segment_indices: &[u32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] road_indices: &[u32],
-    #[spirv(descriptor_set = 0, binding = 5)] road_id_atlas: &StorageImage2d,
+    #[spirv(descriptor_set = 0, binding = 5)] road_id_atlas: &Image!(
+        2D,
+        format = r16f,
+        sampled = false
+    ),
 ) {
     if id.x >= pc.tile_resolution || id.y >= pc.tile_resolution {
         return;
@@ -88,7 +96,7 @@ pub fn sdf_generate_main(
     );
 
     unsafe {
-        sdf_atlas.write(atlas_pos, Vec4::new(best_signed_dist, best_s, 0.0, 0.0));
+        sdf_atlas.write(atlas_pos, Vec2::new(best_signed_dist, best_s));
     }
 
     // Write road ID atlas (R16_SFLOAT) at lower resolution (every Nth texel)
@@ -102,7 +110,7 @@ pub fn sdf_generate_main(
             (pc.road_id_atlas_offset_y + rid_y) as i32,
         );
         unsafe {
-            road_id_atlas.write(road_id_pos, Vec4::new(best_road, 0.0, 0.0, 0.0));
+            road_id_atlas.write(road_id_pos, best_road);
         }
     }
 }

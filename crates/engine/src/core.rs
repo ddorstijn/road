@@ -76,8 +76,7 @@ impl Core {
         let base_features = vk::PhysicalDeviceFeatures::builder()
             .pipeline_statistics_query(true)
             .robust_buffer_access(true)
-            .shader_storage_image_write_without_format(true)
-            .shader_storage_image_read_without_format(true);
+            .shader_storage_image_extended_formats(true);
 
         let physical_device = PhysicalDeviceSelector::new(instance.clone())
             .preferred_device_type(PreferredDeviceType::Discrete)

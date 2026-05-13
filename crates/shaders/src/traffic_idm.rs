@@ -1,3 +1,5 @@
+use crate::road_eval::{compute_lane_offset, curvature_at_s};
+use gpu_shared::{GpuLane, GpuLaneSection, GpuRoad, GpuSegment};
 use spirv_std::glam::UVec3;
 use spirv_std::num_traits::Float;
 use spirv_std::spirv;
@@ -36,6 +38,10 @@ pub fn traffic_idm_main(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] car_desired_speed: &[f32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] road_total_lengths: &[f32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] sorted_indices: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] roads: &[GpuRoad],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 8)] segments: &[GpuSegment],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 9)] lane_sections: &[GpuLaneSection],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 10)] lanes: &[GpuLane],
 ) {
     let sorted_idx = gid.x;
     if sorted_idx >= pc.car_count {
@@ -49,6 +55,17 @@ pub fn traffic_idm_main(
     let speed = car_speed[car_idx];
     let desired_speed = car_desired_speed[car_idx];
     let road_len = road_total_lengths[road_id as usize];
+
+    // Curvature correction: convert between reference-line s and actual lane arc-length.
+    // For a lane at lateral offset t from a reference line with curvature kappa,
+    // ds_ref = v_actual * dt / (1 - kappa * t)
+    let kappa = curvature_at_s(road_id, s, roads, segments);
+    let t = compute_lane_offset(road_id, lane, s, roads, lane_sections, lanes);
+    let kt = kappa * t;
+    // Clamp to avoid singularity (lane offset should never exceed radius of curvature)
+    let lane_factor = (1.0 - kt).clamp(0.25, 4.0);
+    // correction converts actual speed to reference-line ds/dt
+    let ref_correction = 1.0 / lane_factor;
 
     let is_left = lane < 0;
 

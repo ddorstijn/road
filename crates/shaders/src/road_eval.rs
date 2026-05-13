@@ -366,3 +366,38 @@ pub fn compute_lane_offset(
 
     offset
 }
+
+/// Return the curvature of the reference line at a given s-coordinate on a road.
+/// Lines return 0, arcs return constant curvature, spirals return linearly interpolated curvature.
+pub fn curvature_at_s(road_id: u32, s_global: f32, roads: &[GpuRoad], segments: &[GpuSegment]) -> f32 {
+    let road = roads[road_id as usize];
+
+    let mut local_s = s_global;
+    let mut seg_idx = road.segment_offset;
+
+    let mut i = 0u32;
+    while i < road.segment_count {
+        let seg = segments[(road.segment_offset + i) as usize];
+        if s_global < seg.s_start + seg.length || i == road.segment_count - 1 {
+            seg_idx = road.segment_offset + i;
+            local_s = (s_global - seg.s_start).clamp(0.0, seg.length);
+            break;
+        }
+        i += 1;
+    }
+
+    let seg = segments[seg_idx as usize];
+    match seg.segment_type {
+        0 => 0.0, // Line
+        1 => seg.k_start, // Arc (constant curvature)
+        _ => {
+            // Spiral: linearly interpolated curvature
+            let dk = if seg.length > 1e-9 {
+                (seg.k_end - seg.k_start) / seg.length
+            } else {
+                0.0
+            };
+            seg.k_start + dk * local_s
+        }
+    }
+}

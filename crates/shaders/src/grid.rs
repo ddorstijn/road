@@ -1,7 +1,7 @@
 use spirv_std::glam::{Mat4, UVec2, UVec3, Vec2, Vec3, Vec4};
-use spirv_std::image::StorageImage2d;
 use spirv_std::num_traits::Float;
 use spirv_std::spirv;
+use spirv_std::Image;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -17,7 +17,11 @@ pub struct CameraParams {
 pub fn grid_main(
     #[spirv(global_invocation_id)] id: UVec3,
     #[spirv(push_constant)] camera: &CameraParams,
-    #[spirv(descriptor_set = 0, binding = 0)] output: &StorageImage2d,
+    #[spirv(descriptor_set = 0, binding = 0)] output: &Image!(
+        2D,
+        format = rgba16f,
+        sampled = false
+    ),
 ) {
     let size = UVec2::new(camera.width, camera.height);
     if id.x >= size.x || id.y >= size.y {
