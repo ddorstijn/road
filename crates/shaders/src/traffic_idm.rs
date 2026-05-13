@@ -141,8 +141,11 @@ pub fn traffic_idm_main(
         }
     }
 
-    // Compute IDM acceleration
-    let accel = idm_acceleration(pc, speed, desired_speed, delta_v, gap);
+    // Convert reference-line gap to actual lane arc-length gap
+    let lane_gap = gap * lane_factor;
+
+    // Compute IDM acceleration using actual lane gap
+    let accel = idm_acceleration(pc, speed, desired_speed, delta_v, lane_gap);
 
     // Update speed
     let mut new_speed = speed + accel * pc.dt;
@@ -156,9 +159,10 @@ pub fn traffic_idm_main(
     }
     car_speed[car_idx] = new_speed;
 
-    // Advance position
+    // Advance position (convert actual speed to reference-line ds/dt)
+    let ds = new_speed * pc.dt * ref_correction;
     if is_left {
-        let mut new_s = s - new_speed * pc.dt;
+        let mut new_s = s - ds;
         if new_s < 0.0 {
             new_s += road_len;
         }
@@ -167,7 +171,7 @@ pub fn traffic_idm_main(
         }
         car_s[car_idx] = new_s;
     } else {
-        let mut new_s = s + new_speed * pc.dt;
+        let mut new_s = s + ds;
         if new_s >= road_len {
             new_s -= road_len;
         }

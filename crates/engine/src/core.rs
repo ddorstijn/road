@@ -58,7 +58,7 @@ impl Core {
         let instance = InstanceBuilder::new(Some(window.clone()))
             .app_name("traffic-sim")
             .engine_name("road-engine")
-            .request_validation_layers(true)
+            .request_validation_layers(cfg!(debug_assertions))
             .minimum_instance_version(Version::new(1, 3, 0))
             .require_api_version(Version::new(1, 3, 0))
             .build()?;

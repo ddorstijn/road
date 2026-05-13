@@ -242,15 +242,18 @@ pub struct TileCullPass {
     pass: ComputePass,
     /// Buffer holding the indirect draw command.
     pub draw_indirect_buf: GpuBuffer,
-    /// Buffer holding all tile instances (uploaded from CPU).
-    pub all_tiles_buf: Option<GpuBuffer>,
+    /// Double-buffered tile instance input (one per frame-in-flight).
+    all_tiles_bufs: [Option<GpuBuffer>; 2],
     /// Buffer holding visible (compacted) tile instances.
     pub visible_tiles_buf: GpuBuffer,
-    /// Number of tiles currently in all_tiles_buf.
+    /// Number of tiles currently uploaded.
     pub tile_count: u32,
     /// Max tiles this pass was allocated for.
     max_tiles: u32,
-    descriptors_dirty: bool,
+    /// Per-frame descriptor dirty flags.
+    descriptors_dirty: [bool; 2],
+    /// Per-frame flag: buffer has stale data and needs re-upload.
+    needs_upload: [bool; 2],
 }
 
 impl TileCullPass {
@@ -261,13 +264,14 @@ impl TileCullPass {
         max_tiles: u32,
     ) -> anyhow::Result<Self> {
         // 3 bindings: 0 all_tiles, 1 draw_indirect, 2 visible_tiles
+        // 2 descriptor sets for double-buffering across frames-in-flight.
         let pass = ComputePass::new(
             device,
             spirv,
             "frustum_cull::tile_cull_main",
             3,
             std::mem::size_of::<TileCullPushConstants>() as u32,
-            1,
+            2,
         )?;
 
         let draw_indirect_buf = GpuBuffer::new(
@@ -287,28 +291,42 @@ impl TileCullPass {
         Ok(Self {
             pass,
             draw_indirect_buf,
-            all_tiles_buf: None,
+            all_tiles_bufs: [None, None],
             visible_tiles_buf,
             tile_count: 0,
             max_tiles,
-            descriptors_dirty: true,
+            descriptors_dirty: [true, true],
+            needs_upload: [false, false],
         })
+    }
+
+    /// Check whether the buffer for `frame_index` needs a re-upload.
+    pub fn needs_upload(&self, frame_index: usize) -> bool {
+        self.needs_upload[frame_index]
+    }
+
+    /// Mark the buffer at `frame_index` as needing a re-upload.
+    pub fn mark_needs_upload(&mut self, frame_index: usize) {
+        self.needs_upload[frame_index] = true;
     }
 
     /// Upload tile instance data from the SDF tile manager.
     /// Builds a GpuTileInstance for each tile that has an atlas slot.
+    /// `frame_index` selects which double-buffered slot to write (typically `frame_number % 2`).
     pub fn upload_tile_instances(
         &mut self,
+        device: &Device,
         allocator: &vma::Allocator,
         sdf: &SdfTileManager,
+        frame_index: usize,
     ) -> anyhow::Result<()> {
-        // Destroy old buffer
-        if let Some(b) = self.all_tiles_buf.take() {
-            b.destroy(allocator);
-        }
-
         let tile_count = sdf.tile_to_slot.len();
         if tile_count == 0 {
+            // Destroy old buffer if present; no commands are in flight for this
+            // frame index (fence waited at frame start).
+            if let Some(b) = self.all_tiles_bufs[frame_index].take() {
+                b.destroy(allocator);
+            }
             self.tile_count = 0;
             return Ok(());
         }
@@ -323,6 +341,8 @@ impl TileCullPass {
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             )?;
             self.max_tiles = new_max;
+            // Both descriptor sets reference visible_tiles_buf, so both are stale.
+            self.descriptors_dirty = [true, true];
         }
 
         let atlas_tiles = sdf.atlas_tiles_dim;
@@ -343,9 +363,12 @@ impl TileCullPass {
             let uv_scale = TILE_RESOLUTION as f32 / atlas_size_f - 2.0 * half_texel;
 
             // Road ID atlas UVs
-            let rid_uv_offset_x = (slot_x * ROAD_ID_RESOLUTION) as f32 / road_id_atlas_size_f + road_id_half_texel;
-            let rid_uv_offset_y = (slot_y * ROAD_ID_RESOLUTION) as f32 / road_id_atlas_size_f + road_id_half_texel;
-            let rid_uv_scale = ROAD_ID_RESOLUTION as f32 / road_id_atlas_size_f - 2.0 * road_id_half_texel;
+            let rid_uv_offset_x =
+                (slot_x * ROAD_ID_RESOLUTION) as f32 / road_id_atlas_size_f + road_id_half_texel;
+            let rid_uv_offset_y =
+                (slot_y * ROAD_ID_RESOLUTION) as f32 / road_id_atlas_size_f + road_id_half_texel;
+            let rid_uv_scale =
+                ROAD_ID_RESOLUTION as f32 / road_id_atlas_size_f - 2.0 * road_id_half_texel;
 
             let (wx, wy) = key.world_origin();
 
@@ -366,43 +389,61 @@ impl TileCullPass {
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
-        self.all_tiles_buf = Some(buf);
+
+        // Swap in the new buffer, keeping the old one alive until the
+        // descriptor set is updated so it no longer references it.
+        let old = self.all_tiles_bufs[frame_index].replace(buf);
         self.tile_count = tile_count as u32;
-        self.descriptors_dirty = true;
+        self.descriptors_dirty[frame_index] = true;
+        self.needs_upload[frame_index] = false;
+
+        // Update the descriptor set to point to the new buffer before
+        // destroying the old one — avoids destroying a buffer while a
+        // descriptor set still references it.
+        self.update_descriptors(device, frame_index);
+
+        if let Some(old_buf) = old {
+            old_buf.destroy(allocator);
+        }
 
         Ok(())
     }
 
-    /// Update descriptors if needed.
-    pub fn update_descriptors(&mut self, device: &Device) {
-        if !self.descriptors_dirty {
+    /// Update descriptors for the given frame index if needed.
+    fn update_descriptors(&mut self, device: &Device, frame_index: usize) {
+        if !self.descriptors_dirty[frame_index] {
             return;
         }
-        let all_buf = match &self.all_tiles_buf {
+        let all_buf = match &self.all_tiles_bufs[frame_index] {
             Some(b) => b,
             None => return,
         };
 
         write_storage_buffers(
             device,
-            self.pass.set(),
+            self.pass.set_at(frame_index),
             0,
             &[all_buf, &self.draw_indirect_buf, &self.visible_tiles_buf],
         );
-        self.descriptors_dirty = false;
+        self.descriptors_dirty[frame_index] = false;
     }
 
     /// Record the cull dispatch.
+    /// `frame_index` selects the double-buffered descriptor set (typically `frame_number % 2`).
     pub fn dispatch(
-        &self,
+        &mut self,
         device: &Device,
         cmd: vk::CommandBuffer,
         camera: &Camera2D,
         aspect: f32,
+        frame_index: usize,
     ) {
-        if self.tile_count == 0 || self.all_tiles_buf.is_none() {
+        if self.tile_count == 0 || self.all_tiles_bufs[frame_index].is_none() {
             return;
         }
+
+        // Ensure descriptors are up-to-date for this frame.
+        self.update_descriptors(device, frame_index);
 
         // Reset indirect draw command: vertex_count=6, instance_count=0
         let reset_cmd = DrawIndirectCommand {
@@ -447,7 +488,7 @@ impl TileCullPass {
                 vk::PipelineBindPoint::COMPUTE,
                 self.pass.pipeline_layout,
                 0,
-                &[self.pass.set()],
+                &[self.pass.set_at(frame_index)],
                 &[],
             );
             device.cmd_push_constants(
@@ -477,8 +518,10 @@ impl TileCullPass {
     pub fn destroy(&mut self, device: &Device, allocator: &vma::Allocator) {
         self.pass.destroy(device);
         self.draw_indirect_buf.destroy(allocator);
-        if let Some(b) = self.all_tiles_buf.take() {
-            b.destroy(allocator);
+        for buf in &mut self.all_tiles_bufs {
+            if let Some(b) = buf.take() {
+                b.destroy(allocator);
+            }
         }
         self.visible_tiles_buf.destroy(allocator);
     }

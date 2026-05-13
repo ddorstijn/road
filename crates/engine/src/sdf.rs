@@ -22,6 +22,8 @@ pub const TILE_SIZE: f32 = 64.0;
 pub const TILE_RESOLUTION: u32 = 64;
 /// Texels per tile dimension for the road-ID atlas.
 pub const ROAD_ID_RESOLUTION: u32 = 32;
+/// Maximum number of dirty tiles dispatched per frame to avoid GPU stalls.
+const MAX_DIRTY_DISPATCH: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Push constants — must match the shader
@@ -447,7 +449,15 @@ impl SdfTileManager {
             return;
         }
 
-        // Determine which tile keys overlap the view AABB
+        // Pad the view bounds by one tile in each direction to prevent
+        // thrashing when the camera sits exactly on a tile boundary and to
+        // pre-load tiles just outside the viewport for smoother panning.
+        let min_x = min_x - TILE_SIZE;
+        let min_y = min_y - TILE_SIZE;
+        let max_x = max_x + TILE_SIZE;
+        let max_y = max_y + TILE_SIZE;
+
+        // Determine which tile keys overlap the padded view AABB
         let tile_min_ix = (min_x / TILE_SIZE).floor() as i32;
         let tile_min_iy = (min_y / TILE_SIZE).floor() as i32;
         let tile_max_ix = (max_x / TILE_SIZE).floor() as i32;
@@ -692,7 +702,15 @@ impl SdfTileManager {
             );
         }
 
-        let dirty: Vec<TileKey> = self.dirty_tiles.drain().collect();
+        let dirty: Vec<TileKey> = self
+            .dirty_tiles
+            .iter()
+            .copied()
+            .take(MAX_DIRTY_DISPATCH)
+            .collect();
+        for key in &dirty {
+            self.dirty_tiles.remove(key);
+        }
         for key in &dirty {
             let info = match self.tile_map.tiles.get(key) {
                 Some(info) => info,

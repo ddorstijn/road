@@ -961,24 +961,27 @@ impl TrafficApp {
         let (min_x, min_y, max_x, max_y) = camera_world_bounds(ctx.camera, aspect);
         sdf.update_visible(min_x, min_y, max_x, max_y);
 
-        if !sdf.tiles_changed {
-            return Ok(());
-        }
-        sdf.tiles_changed = false;
+        let frame_index = (ctx.frame_number % 2) as usize;
 
-        // Wait for GPU to finish using the old buffers/descriptors
-        unsafe {
-            ctx.device.device_wait_idle()?;
-        }
+        // Upload tile instances when the tile set changed, or when the
+        // other frame's buffer is stale from a previous change.
+        let tc = match self.tile_cull.as_mut() {
+            Some(tc) => tc,
+            None => return Ok(()),
+        };
 
-        // Re-upload tile instances for the frustum cull pass
-        if let Some(tc) = &mut self.tile_cull {
+        if sdf.tiles_changed {
+            sdf.tiles_changed = false;
+
             let sdf = self.sdf_manager.as_ref().unwrap();
-            tc.upload_tile_instances(ctx.allocator, sdf)?;
-            tc.update_descriptors(ctx.device.as_ref());
+            tc.upload_tile_instances(ctx.device.as_ref(), ctx.allocator, sdf, frame_index)?;
+            // The other frame's buffer now has stale data.
+            tc.mark_needs_upload(frame_index ^ 1);
+        } else if tc.needs_upload(frame_index) {
+            // Sync the current frame's buffer with the latest tile data.
+            let sdf = self.sdf_manager.as_ref().unwrap();
+            tc.upload_tile_instances(ctx.device.as_ref(), ctx.allocator, sdf, frame_index)?;
         }
-
-        self.update_road_render_descriptors(ctx);
 
         Ok(())
     }
@@ -1138,9 +1141,10 @@ impl TrafficApp {
         }
     }
 
-    fn dispatch_frustum_cull(&self, ctx: &EngineContext, cmd: vk::CommandBuffer) {
+    fn dispatch_frustum_cull(&mut self, ctx: &EngineContext, cmd: vk::CommandBuffer) {
         let device = ctx.device.as_ref();
         let aspect = ctx.window_width as f32 / ctx.window_height as f32;
+        let frame_index = (ctx.frame_number % 2) as usize;
 
         // Car frustum cull
         if let Some(car_cull) = &self.car_cull {
@@ -1148,8 +1152,8 @@ impl TrafficApp {
         }
 
         // Tile frustum cull
-        if let Some(tile_cull) = &self.tile_cull {
-            tile_cull.dispatch(device, cmd, ctx.camera, aspect);
+        if let Some(tile_cull) = &mut self.tile_cull {
+            tile_cull.dispatch(device, cmd, ctx.camera, aspect, frame_index);
         }
     }
 

@@ -247,12 +247,12 @@ impl TrafficSim {
             2,
         )?);
 
-        // IDM car-following (7 SSBOs)
+        // IDM car-following (11 SSBOs: car SoA + road_lengths + sorted_indices + road geometry)
         self.idm_pass = Some(ComputePass::new(
             device,
             &spirv,
             "traffic_idm::traffic_idm_main",
-            7,
+            11,
             std::mem::size_of::<IdmPushConstants>() as u32,
             1,
         )?);
@@ -594,9 +594,14 @@ impl TrafficSim {
             );
         }
 
-        // IDM: bindings 0-6 = car SoA + road_lengths + sorted_indices
+        // IDM: bindings 0-10 = car SoA + road_lengths + sorted_indices + road geometry
         // After 4 sort passes: final sorted indices are in vals_a
-        if let Some(pass) = &self.idm_pass {
+        if let Some(pass) = &self.idm_pass
+            && let Some(rd_buf) = road_buffer
+            && let Some(seg_buf) = segment_buffer
+            && let Some(ls_buf) = lane_section_buffer
+            && let Some(ln_buf) = lane_buffer
+        {
             write_storage_buffers(
                 device,
                 pass.set(),
@@ -609,6 +614,10 @@ impl TrafficSim {
                     car_desired,
                     road_lengths,
                     sort_vals_a,
+                    rd_buf,
+                    seg_buf,
+                    ls_buf,
+                    ln_buf,
                 ],
             );
         }
@@ -931,9 +940,7 @@ impl TrafficSim {
     }
 
     /// Access car SoA buffers for frustum cull descriptor binding.
-    pub fn car_buffers(
-        &self,
-    ) -> Option<(&GpuBuffer, &GpuBuffer, &GpuBuffer)> {
+    pub fn car_buffers(&self) -> Option<(&GpuBuffer, &GpuBuffer, &GpuBuffer)> {
         match (&self.car_road_id_buf, &self.car_s_buf, &self.car_lane_buf) {
             (Some(road_id), Some(s), Some(lane)) => Some((road_id, s, lane)),
             _ => None,
