@@ -120,17 +120,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ];
 
+    // Use debug info + no optimization for dev builds, optimized for release
+    let is_release = std::env::var("PROFILE").unwrap_or_default() == "release";
+
     for &(module_name, entry_name, env_name) in shaders {
         let source_path = shader_dir.join(format!("{}.slang", module_name));
         let out_path = out_dir.join(format!("{}_{}.spv", module_name, entry_name));
 
-        let output = Command::new("slangc")
-            .arg(source_path.to_str().unwrap())
+        let mut cmd = Command::new("slangc");
+        cmd.arg(source_path.to_str().unwrap())
             .args(["-target", "spirv"])
             .args(["-entry", entry_name])
             .args(["-profile", "glsl_450"])
-            .args(["-I", shader_dir_str])
-            .args(["-O3"])
+            .args(["-I", shader_dir_str]);
+
+        if is_release {
+            cmd.arg("-O3");
+        } else {
+            cmd.args(["-O0", "-g"]);
+        }
+
+        let output = cmd
             .args(["-o", out_path.to_str().unwrap()])
             .output()
             .expect("Failed to run slangc. Is the Vulkan SDK installed and slangc in PATH?");
