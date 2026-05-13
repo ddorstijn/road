@@ -549,8 +549,8 @@ impl SdfTileManager {
         self.free_slots.extend((0..total_slots).rev());
         self.dirty_tiles.clear();
         self.tiles_changed = true;
-        // All atlas data is now stale — next dispatch should discard contents
-        self.atlas_layout = vk::ImageLayout::UNDEFINED;
+        // Keep atlas_layout as-is so the next transition preserves existing
+        // pixel data; stale tiles will be overwritten once dispatched.
     }
 
     /// Upload tile map data to GPU and update descriptors for segment/tile buffers.
@@ -683,9 +683,18 @@ impl SdfTileManager {
         Ok(())
     }
 
-    /// Record compute dispatches for all dirty tiles. Call this during command
+    /// Record compute dispatches for dirty tiles. Call this during command
     /// buffer recording. The atlas image must be in GENERAL layout.
-    pub fn dispatch_dirty_tiles(&mut self, device: &Device, cmd: vk::CommandBuffer) {
+    ///
+    /// When `flush_all` is true every dirty tile is dispatched in one go
+    /// (used after a road rebuild). Otherwise at most `MAX_DIRTY_DISPATCH`
+    /// tiles are processed to spread streaming cost across frames.
+    pub fn dispatch_dirty_tiles(
+        &mut self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        flush_all: bool,
+    ) {
         if self.dirty_tiles.is_empty() {
             return;
         }
@@ -702,12 +711,15 @@ impl SdfTileManager {
             );
         }
 
-        let dirty: Vec<TileKey> = self
-            .dirty_tiles
-            .iter()
-            .copied()
-            .take(MAX_DIRTY_DISPATCH)
-            .collect();
+        let dirty: Vec<TileKey> = if flush_all {
+            self.dirty_tiles.iter().copied().collect()
+        } else {
+            self.dirty_tiles
+                .iter()
+                .copied()
+                .take(MAX_DIRTY_DISPATCH)
+                .collect()
+        };
         for key in &dirty {
             self.dirty_tiles.remove(key);
         }
@@ -1048,7 +1060,7 @@ impl SdfTileManager {
                 vk::ImageLayout::GENERAL,
             );
 
-            self.dispatch_dirty_tiles(device, cmd);
+            self.dispatch_dirty_tiles(device, cmd, true);
 
             // Barrier: compute writes → transfer reads
             unsafe {

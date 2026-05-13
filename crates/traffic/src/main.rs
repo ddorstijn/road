@@ -604,9 +604,9 @@ impl TrafficApp {
         Ok(())
     }
 
-    fn handle_dirty_roads(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
+    fn handle_dirty_roads(&mut self, ctx: &EngineContext) -> anyhow::Result<bool> {
         if !self.dirty {
-            return Ok(());
+            return Ok(false);
         }
 
         unsafe {
@@ -746,7 +746,7 @@ impl TrafficApp {
         }
 
         self.dirty = false;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -986,7 +986,7 @@ impl TrafficApp {
         Ok(())
     }
 
-    fn dispatch_sdf(&mut self, device: &engine::VkDevice, cmd: vk::CommandBuffer) {
+    fn dispatch_sdf(&mut self, device: &engine::VkDevice, cmd: vk::CommandBuffer, flush_all: bool) {
         let sdf = match self.sdf_manager.as_mut() {
             Some(s) => s,
             None => return,
@@ -1020,7 +1020,7 @@ impl TrafficApp {
 
         // GPU-generate dirty tiles
         if has_dirty {
-            sdf.dispatch_dirty_tiles(device, cmd);
+            sdf.dispatch_dirty_tiles(device, cmd, flush_all);
         }
 
         // Upload cached tiles from disk I/O thread
@@ -1397,13 +1397,15 @@ impl App for TrafficApp {
         if needs_rebuild {
             self.rebuild_polyline(ctx)?;
         }
-        self.handle_dirty_roads(ctx)?;
+        let roads_rebuilt = self.handle_dirty_roads(ctx)?;
 
         // Phase: Stream tiles into atlas based on camera view
         self.stream_visible_tiles(ctx)?;
 
         // Phase: SDF tile generation
-        self.dispatch_sdf(device, cmd);
+        // After a road rebuild, flush all dirty tiles in one go to avoid
+        // partially-stale atlas content being visible for multiple frames.
+        self.dispatch_sdf(device, cmd, roads_rebuilt);
 
         // Phase: Grid background
         self.dispatch_grid(ctx, cmd);
