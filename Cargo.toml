@@ -1,23 +1,24 @@
 [workspace]
-members = ["crates/*"]
-exclude = ["crates/shaders"]
+members = [
+    "crates/engine",
+    "crates/gpu-shared",
+    "crates/road",
+    "crates/traffic",
+]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 keywords = ["vulkan", "bindings", "graphics", "gpu", "rendering"]
 
-# Compile build-dependencies in release mode so rustc_codegen_spirv is optimized
-# for fast shader compilation. Also avoids MSVC LNK1189 (COFF section limit).
 [profile.dev.build-override]
-opt-level = 3
+opt-level = 0
 
 [profile.release]
 codegen-units = 1
 
 [profile.release.build-override]
-opt-level = 3
-codegen-units = 16
+opt-level = 0
 
 # Optimized build for GPU profiling (RGP etc).
 [profile.profiling]

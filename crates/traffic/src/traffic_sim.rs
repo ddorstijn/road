@@ -6,7 +6,7 @@ use engine::{ComputePass, EngineContext};
 use rand::Rng;
 use road::network::RoadNetwork;
 
-use crate::GRID_SPIRV;
+use crate::shader_spirv;
 use crate::spirv_bytes_to_words;
 
 // ---------------------------------------------------------------------------
@@ -202,73 +202,91 @@ impl Default for TrafficSim {
 impl TrafficSim {
     pub fn create_pipelines(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
         let device = ctx.device.as_ref();
-        let spirv = spirv_bytes_to_words(GRID_SPIRV);
 
         // Car renderer (instanced rendering)
         {
-            self.car_renderer = Some(CarRenderer::new(device, ctx.draw_image.format, &spirv)?);
+            let vs_spirv = spirv_bytes_to_words(shader_spirv::CAR_RENDER_VS);
+            let fs_spirv = spirv_bytes_to_words(shader_spirv::CAR_RENDER_FS);
+            self.car_renderer = Some(CarRenderer::new(device, ctx.draw_image.format, &vs_spirv, &fs_spirv)?);
         }
 
         // Sort: build keys (6 SSBOs)
-        self.sort_keys_pass = Some(ComputePass::new(
-            device,
-            &spirv,
-            "traffic_sort_keys::traffic_sort_keys_main",
-            6,
-            std::mem::size_of::<SortKeysPushConstants>() as u32,
-            1,
-        )?);
+        {
+            let spirv = spirv_bytes_to_words(shader_spirv::SORT_KEYS);
+            self.sort_keys_pass = Some(ComputePass::new(
+                device,
+                &spirv,
+                "main",
+                6,
+                std::mem::size_of::<SortKeysPushConstants>() as u32,
+                1,
+            )?);
+        }
 
         // Sort: histogram (2 SSBOs, 2 sets for ping-pong)
-        self.sort_histogram_pass = Some(ComputePass::new(
-            device,
-            &spirv,
-            "traffic_sort_histogram::traffic_sort_histogram_main",
-            2,
-            std::mem::size_of::<SortHistogramPushConstants>() as u32,
-            2,
-        )?);
+        {
+            let spirv = spirv_bytes_to_words(shader_spirv::SORT_HISTOGRAM);
+            self.sort_histogram_pass = Some(ComputePass::new(
+                device,
+                &spirv,
+                "main",
+                2,
+                std::mem::size_of::<SortHistogramPushConstants>() as u32,
+                2,
+            )?);
+        }
 
         // Sort: prefix sum scan (1 SSBO)
-        self.sort_scan_pass = Some(ComputePass::new(
-            device,
-            &spirv,
-            "traffic_sort_scan::traffic_sort_scan_main",
-            1,
-            std::mem::size_of::<SortScanPushConstants>() as u32,
-            1,
-        )?);
+        {
+            let spirv = spirv_bytes_to_words(shader_spirv::SORT_SCAN);
+            self.sort_scan_pass = Some(ComputePass::new(
+                device,
+                &spirv,
+                "main",
+                1,
+                std::mem::size_of::<SortScanPushConstants>() as u32,
+                1,
+            )?);
+        }
 
         // Sort: scatter (5 SSBOs, 2 sets for ping-pong)
-        self.sort_scatter_pass = Some(ComputePass::new(
-            device,
-            &spirv,
-            "traffic_sort_scatter::traffic_sort_scatter_main",
-            5,
-            std::mem::size_of::<SortScatterPushConstants>() as u32,
-            2,
-        )?);
+        {
+            let spirv = spirv_bytes_to_words(shader_spirv::SORT_SCATTER);
+            self.sort_scatter_pass = Some(ComputePass::new(
+                device,
+                &spirv,
+                "main",
+                5,
+                std::mem::size_of::<SortScatterPushConstants>() as u32,
+                2,
+            )?);
+        }
 
         // IDM car-following (11 SSBOs: car SoA + road_lengths + sorted_indices + road geometry)
-        self.idm_pass = Some(ComputePass::new(
-            device,
-            &spirv,
-            "traffic_idm::traffic_idm_main",
-            11,
-            std::mem::size_of::<IdmPushConstants>() as u32,
-            1,
-        )?);
+        {
+            let spirv = spirv_bytes_to_words(shader_spirv::TRAFFIC_IDM);
+            self.idm_pass = Some(ComputePass::new(
+                device,
+                &spirv,
+                "main",
+                11,
+                std::mem::size_of::<IdmPushConstants>() as u32,
+                1,
+            )?);
+        }
 
         // MOBIL lane change (9 SSBOs: car SoA + preferred_headway + road_lengths + sorted_indices + road_lane_counts)
-        self.mobil_pass = Some(ComputePass::new(
-            device,
-            &spirv,
-            "traffic_lane_change::traffic_lane_change_main",
-            9,
-            std::mem::size_of::<MobilPushConstants>() as u32,
-            1,
-        )?);
-
+        {
+            let spirv = spirv_bytes_to_words(shader_spirv::TRAFFIC_LANE_CHANGE);
+            self.mobil_pass = Some(ComputePass::new(
+                device,
+                &spirv,
+                "main",
+                9,
+                std::mem::size_of::<MobilPushConstants>() as u32,
+                1,
+            )?);
+        }
         Ok(())
     }
 

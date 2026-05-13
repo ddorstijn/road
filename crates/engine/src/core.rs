@@ -63,6 +63,9 @@ impl Core {
             .require_api_version(Version::new(1, 3, 0))
             .build()?;
 
+        let features11 = vk::PhysicalDeviceVulkan11Features::builder()
+            .shader_draw_parameters(true);
+
         let features12 = vk::PhysicalDeviceVulkan12Features::builder()
             .buffer_device_address(true)
             .descriptor_indexing(true)
@@ -81,6 +84,7 @@ impl Core {
         let physical_device = PhysicalDeviceSelector::new(instance.clone())
             .preferred_device_type(PreferredDeviceType::Discrete)
             .add_required_features(*base_features)
+            .add_required_extension_feature(*features11)
             .add_required_extension_feature(*features12)
             .add_required_extension_feature(*features13)
             .select()?;

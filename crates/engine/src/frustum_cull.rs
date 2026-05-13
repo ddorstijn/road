@@ -84,7 +84,7 @@ impl CarCullPass {
         let pass = ComputePass::new(
             device,
             spirv,
-            "frustum_cull::car_cull_main",
+            "main",
             9, // num_storage_buffers
             std::mem::size_of::<CarCullPushConstants>() as u32,
             1,
@@ -268,7 +268,7 @@ impl TileCullPass {
         let pass = ComputePass::new(
             device,
             spirv,
-            "frustum_cull::tile_cull_main",
+            "main",
             3,
             std::mem::size_of::<TileCullPushConstants>() as u32,
             2,

@@ -384,7 +384,7 @@ impl SdfTileManager {
         let (pipeline, pipeline_layout) = create_compute_pipeline(
             device,
             spirv,
-            "sdf_generate::sdf_generate_main",
+            "main",
             &[descriptor_set_layout],
             &push_constant_ranges,
         )?;

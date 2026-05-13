@@ -22,10 +22,27 @@ use crate::gpu_road_data::{GpuRoadData, segment_type_info};
 use crate::traffic_sim::{SIM_DT, TrafficSim};
 
 // ---------------------------------------------------------------------------
-// Pre-compiled SPIR-V shaders (built by spirv-builder in build.rs)
+// Pre-compiled SPIR-V shaders (built by Slang in build.rs)
 // ---------------------------------------------------------------------------
 
-pub const GRID_SPIRV: &[u8] = include_bytes!(env!("shaders.spv"));
+pub mod shader_spirv {
+    pub const GRID: &[u8] = include_bytes!(env!("SHADER_GRID"));
+    pub const ROAD_LINE_VS: &[u8] = include_bytes!(env!("SHADER_ROAD_LINE_VS"));
+    pub const ROAD_LINE_FS: &[u8] = include_bytes!(env!("SHADER_ROAD_LINE_FS"));
+    pub const SDF_GENERATE: &[u8] = include_bytes!(env!("SHADER_SDF_GENERATE"));
+    pub const ROAD_RENDER_VS: &[u8] = include_bytes!(env!("SHADER_ROAD_RENDER_VS"));
+    pub const ROAD_RENDER_FS: &[u8] = include_bytes!(env!("SHADER_ROAD_RENDER_FS"));
+    pub const CAR_CULL: &[u8] = include_bytes!(env!("SHADER_CAR_CULL"));
+    pub const TILE_CULL: &[u8] = include_bytes!(env!("SHADER_TILE_CULL"));
+    pub const CAR_RENDER_VS: &[u8] = include_bytes!(env!("SHADER_CAR_RENDER_VS"));
+    pub const CAR_RENDER_FS: &[u8] = include_bytes!(env!("SHADER_CAR_RENDER_FS"));
+    pub const SORT_KEYS: &[u8] = include_bytes!(env!("SHADER_SORT_KEYS"));
+    pub const SORT_HISTOGRAM: &[u8] = include_bytes!(env!("SHADER_SORT_HISTOGRAM"));
+    pub const SORT_SCAN: &[u8] = include_bytes!(env!("SHADER_SORT_SCAN"));
+    pub const SORT_SCATTER: &[u8] = include_bytes!(env!("SHADER_SORT_SCATTER"));
+    pub const TRAFFIC_IDM: &[u8] = include_bytes!(env!("SHADER_TRAFFIC_IDM"));
+    pub const TRAFFIC_LANE_CHANGE: &[u8] = include_bytes!(env!("SHADER_TRAFFIC_LANE_CHANGE"));
+}
 
 pub fn spirv_bytes_to_words(bytes: &[u8]) -> Vec<u32> {
     bytes
@@ -229,7 +246,7 @@ impl TrafficApp {
 
         self.update_grid_descriptors(ctx);
 
-        let spirv = spirv_bytes_to_words(GRID_SPIRV);
+        let spirv = spirv_bytes_to_words(shader_spirv::GRID);
 
         let push_constant_ranges = [vk::PushConstantRange::builder()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -240,7 +257,7 @@ impl TrafficApp {
         let (pipeline, layout) = create_compute_pipeline(
             device,
             &spirv,
-            "grid::grid_main",
+            "main",
             &[self.grid_descriptor_set_layout],
             &push_constant_ranges,
         )?;
@@ -253,7 +270,8 @@ impl TrafficApp {
 
     fn create_line_pipeline(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
         let device = ctx.device.as_ref();
-        let spirv = spirv_bytes_to_words(GRID_SPIRV); // road_line entry points are in same module
+        let vs_spirv = spirv_bytes_to_words(shader_spirv::ROAD_LINE_VS);
+        let fs_spirv = spirv_bytes_to_words(shader_spirv::ROAD_LINE_FS);
 
         let push_constant_ranges = [vk::PushConstantRange::builder()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
@@ -283,10 +301,10 @@ impl TrafficApp {
         ];
 
         let desc = GraphicsPipelineDesc {
-            vertex_spirv: &spirv,
-            fragment_spirv: &spirv,
-            vertex_entry: "road_line::vs_main",
-            fragment_entry: "road_line::fs_main",
+            vertex_spirv: &vs_spirv,
+            fragment_spirv: &fs_spirv,
+            vertex_entry: "main",
+            fragment_entry: "main",
             vertex_binding_descriptions: &vertex_bindings,
             vertex_attribute_descriptions: &vertex_attrs,
             topology: vk::PrimitiveTopology::LINE_STRIP,
@@ -306,10 +324,11 @@ impl TrafficApp {
     fn create_sdf_system(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
         let device = ctx.device.as_ref();
 
-        let sdf_spirv = spirv_bytes_to_words(GRID_SPIRV); // sdf_generate entry point
+        let sdf_spirv = spirv_bytes_to_words(shader_spirv::SDF_GENERATE);
         let sdf_manager = SdfTileManager::new(ctx.device, ctx.allocator, &sdf_spirv)?;
 
-        let spirv = spirv_bytes_to_words(GRID_SPIRV); // road_render entry points
+        let road_render_vs_spirv = spirv_bytes_to_words(shader_spirv::ROAD_RENDER_VS);
+        let road_render_fs_spirv = spirv_bytes_to_words(shader_spirv::ROAD_RENDER_FS);
 
         let sampler_info = vk::SamplerCreateInfo::builder()
             .mag_filter(vk::Filter::LINEAR)
@@ -463,10 +482,10 @@ impl TrafficApp {
             .build()];
 
         let desc = GraphicsPipelineDesc {
-            vertex_spirv: &spirv,
-            fragment_spirv: &spirv,
-            vertex_entry: "road_render::vs_main",
-            fragment_entry: "road_render::fs_main",
+            vertex_spirv: &road_render_vs_spirv,
+            fragment_spirv: &road_render_fs_spirv,
+            vertex_entry: "main",
+            fragment_entry: "main",
             vertex_binding_descriptions: &[],
             vertex_attribute_descriptions: &[],
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
@@ -619,7 +638,7 @@ impl TrafficApp {
         // Upload tile instances for frustum culling
         if let Some(sdf) = &self.sdf_manager {
             if self.tile_cull.is_none() {
-                let spirv = spirv_bytes_to_words(GRID_SPIRV);
+                let spirv = spirv_bytes_to_words(shader_spirv::TILE_CULL);
                 // Initial allocation sized to atlas capacity; reallocates if needed
                 let atlas_capacity = sdf.atlas_tiles_dim * sdf.atlas_tiles_dim;
                 self.tile_cull = Some(TileCullPass::new(
@@ -661,7 +680,7 @@ impl TrafficApp {
 
         // Create car cull pass if needed
         if self.car_cull.is_none() {
-            let spirv = spirv_bytes_to_words(GRID_SPIRV);
+            let spirv = spirv_bytes_to_words(shader_spirv::CAR_CULL);
             self.car_cull = Some(CarCullPass::new(
                 ctx.device.as_ref(),
                 ctx.allocator,

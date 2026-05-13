@@ -46,11 +46,12 @@ pub struct CarRenderer {
 impl CarRenderer {
     /// Create the car rendering pipeline.
     ///
-    /// `spirv` is the pre-compiled SPIR-V bytecode containing vs_main and fs_main entry points.
+    /// `vs_spirv` and `fs_spirv` are the pre-compiled SPIR-V bytecodes for vertex and fragment shaders.
     pub fn new(
         device: &Device,
         color_attachment_format: vk::Format,
-        spirv: &[u32],
+        vs_spirv: &[u32],
+        fs_spirv: &[u32],
     ) -> anyhow::Result<Self> {
         // 10 storage buffer bindings: 0-4 car SoA, 5-8 road data, 9 visible_indices
         let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..10)
@@ -85,10 +86,10 @@ impl CarRenderer {
             .build()];
 
         let desc = GraphicsPipelineDesc {
-            vertex_spirv: &spirv,
-            fragment_spirv: &spirv,
-            vertex_entry: "car_render::vs_main",
-            fragment_entry: "car_render::fs_main",
+            vertex_spirv: vs_spirv,
+            fragment_spirv: fs_spirv,
+            vertex_entry: "main",
+            fragment_entry: "main",
             vertex_binding_descriptions: &[],
             vertex_attribute_descriptions: &[],
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,

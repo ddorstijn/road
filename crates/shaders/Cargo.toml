@@ -1,8 +1,0 @@
-[package]
-name = "shaders"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-spirv-std = "0.10.0-alpha.1"
-gpu-shared = { path = "../gpu-shared", default-features = false, features = [] }
