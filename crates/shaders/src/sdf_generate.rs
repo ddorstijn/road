@@ -17,7 +17,8 @@ pub struct SdfPushConstants {
     pub road_id_atlas_offset_x: u32,
     pub road_id_atlas_offset_y: u32,
     pub road_id_resolution: u32,
-    pub _pad: [u32; 2],
+    pub tile_border: u32,
+    pub _pad: u32,
 }
 
 #[spirv(compute(threads(16, 16)))]
@@ -39,13 +40,17 @@ pub fn sdf_generate_main(
         sampled = false
     ),
 ) {
-    if id.x >= pc.tile_resolution || id.y >= pc.tile_resolution {
+    // Total texels per tile slot = data + 2 * border
+    let dispatch_size = pc.tile_resolution + 2 * pc.tile_border;
+    if id.x >= dispatch_size || id.y >= dispatch_size {
         return;
     }
 
     let texel_size = pc.tile_size / pc.tile_resolution as f32;
-    let world_x = pc.tile_world_x + (id.x as f32 + 0.5) * texel_size;
-    let world_y = pc.tile_world_y + (id.y as f32 + 0.5) * texel_size;
+    // Offset world position by -border so border texels cover the area
+    // just outside the tile, enabling bilinear interpolation across tile edges.
+    let world_x = pc.tile_world_x + (id.x as f32 - pc.tile_border as f32 + 0.5) * texel_size;
+    let world_y = pc.tile_world_y + (id.y as f32 - pc.tile_border as f32 + 0.5) * texel_size;
     let world_pos = Vec2::new(world_x, world_y);
 
     let header = tile_headers[pc.tile_index as usize];
@@ -100,17 +105,21 @@ pub fn sdf_generate_main(
     }
 
     // Write road ID atlas (R16_SFLOAT) at lower resolution (every Nth texel)
-    // Map SDF texel to road_id texel: road_id covers same world area at lower res
-    let ratio = pc.tile_resolution / pc.road_id_resolution;
-    if id.x % ratio == 0 && id.y % ratio == 0 {
-        let rid_x = id.x / ratio;
-        let rid_y = id.y / ratio;
-        let road_id_pos = IVec2::new(
-            (pc.road_id_atlas_offset_x + rid_x) as i32,
-            (pc.road_id_atlas_offset_y + rid_y) as i32,
-        );
-        unsafe {
-            road_id_atlas.write(road_id_pos, best_road);
+    // Only interior (non-border) SDF texels contribute to road_id.
+    let interior_x = id.x.wrapping_sub(pc.tile_border);
+    let interior_y = id.y.wrapping_sub(pc.tile_border);
+    if interior_x < pc.tile_resolution && interior_y < pc.tile_resolution {
+        let ratio = pc.tile_resolution / pc.road_id_resolution;
+        if interior_x % ratio == 0 && interior_y % ratio == 0 {
+            let rid_x = interior_x / ratio;
+            let rid_y = interior_y / ratio;
+            let road_id_pos = IVec2::new(
+                (pc.road_id_atlas_offset_x + rid_x) as i32,
+                (pc.road_id_atlas_offset_y + rid_y) as i32,
+            );
+            unsafe {
+                road_id_atlas.write(road_id_pos, best_road);
+            }
         }
     }
 }

@@ -14,7 +14,7 @@ use crate::sdf::TileKey;
 // ---------------------------------------------------------------------------
 
 const MAGIC: [u8; 4] = *b"SDFC";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2; // bumped for bordered SDF tiles
 
 /// Max in-flight requests to avoid memory spikes.
 const MAX_INFLIGHT: usize = 32;

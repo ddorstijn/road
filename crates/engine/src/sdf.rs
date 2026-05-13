@@ -20,6 +20,10 @@ use crate::tile_cache::{SdfCacheFile, TileLoadQueue};
 pub const TILE_SIZE: f32 = 64.0;
 /// Texels per tile dimension for the SDF atlas (signed_dist, s_coord).
 pub const TILE_RESOLUTION: u32 = 64;
+/// Border texels on each side of an SDF tile for bilinear cross-tile interpolation.
+pub const TILE_BORDER: u32 = 1;
+/// Total texels per tile slot in the atlas (data + 2 × border).
+pub const TILE_SLOT_SIZE: u32 = TILE_RESOLUTION + 2 * TILE_BORDER;
 /// Texels per tile dimension for the road-ID atlas.
 pub const ROAD_ID_RESOLUTION: u32 = 32;
 /// Maximum number of dirty tiles dispatched per frame to avoid GPU stalls.
@@ -42,7 +46,8 @@ struct SdfPushConstants {
     road_id_atlas_offset_x: u32,
     road_id_atlas_offset_y: u32,
     road_id_resolution: u32,
-    _pad: [u32; 2],
+    tile_border: u32,
+    _pad: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +288,7 @@ impl SdfTileManager {
         let atlas_dim = DEFAULT_ATLAS_TILES;
 
         // SDF atlas: RG16F, bilinear-sampled (signed_dist + s_coord)
-        let sdf_atlas_size = atlas_dim * TILE_RESOLUTION;
+        let sdf_atlas_size = atlas_dim * TILE_SLOT_SIZE;
         let sdf_atlas = GpuImage::new_storage_2d(
             device,
             allocator,
@@ -733,11 +738,11 @@ impl SdfTileManager {
                 None => continue,
             };
 
-            // SDF atlas texel offset from slot index
+            // SDF atlas texel offset from slot index (includes border)
             let slot_x = slot % self.atlas_tiles_dim;
             let slot_y = slot / self.atlas_tiles_dim;
-            let atlas_offset_x = slot_x * TILE_RESOLUTION;
-            let atlas_offset_y = slot_y * TILE_RESOLUTION;
+            let atlas_offset_x = slot_x * TILE_SLOT_SIZE;
+            let atlas_offset_y = slot_y * TILE_SLOT_SIZE;
 
             // Road ID atlas texel offset
             let road_id_atlas_offset_x = slot_x * ROAD_ID_RESOLUTION;
@@ -756,7 +761,8 @@ impl SdfTileManager {
                 road_id_atlas_offset_x,
                 road_id_atlas_offset_y,
                 road_id_resolution: ROAD_ID_RESOLUTION,
-                _pad: [0; 2],
+                tile_border: TILE_BORDER,
+                _pad: 0,
             };
 
             unsafe {
@@ -768,8 +774,8 @@ impl SdfTileManager {
                     bytemuck::bytes_of(&pc),
                 );
 
-                // Dispatch: (TILE_RESOLUTION/16)^2 workgroups per tile
-                let wg = TILE_RESOLUTION / 16;
+                // Dispatch: ceil(TILE_SLOT_SIZE/16)^2 workgroups per tile
+                let wg = (TILE_SLOT_SIZE + 15) / 16;
                 device.cmd_dispatch(cmd, wg, wg, 1);
             }
         }
@@ -813,7 +819,7 @@ impl SdfTileManager {
             .map_err(|e| anyhow::anyhow!("failed to start tile I/O thread: {}", e))?;
 
         // Create a staging buffer large enough for one tile (SDF + road_id)
-        let sdf_bytes = (TILE_RESOLUTION * TILE_RESOLUTION * 4) as u64; // RG16F
+        let sdf_bytes = (TILE_SLOT_SIZE * TILE_SLOT_SIZE * 4) as u64; // RG16F
         let rid_bytes = (ROAD_ID_RESOLUTION * ROAD_ID_RESOLUTION * 2) as u64; // R16_SFLOAT
         let staging_size = sdf_bytes + rid_bytes;
         let (staging, ptr) = GpuBuffer::new_mapped(
@@ -843,7 +849,7 @@ impl SdfTileManager {
             return 0;
         }
 
-        let sdf_tile_bytes = (TILE_RESOLUTION * TILE_RESOLUTION * 4) as usize;
+        let sdf_tile_bytes = (TILE_SLOT_SIZE * TILE_SLOT_SIZE * 4) as usize;
         let rid_tile_bytes = (ROAD_ID_RESOLUTION * ROAD_ID_RESOLUTION * 2) as usize;
         let per_tile = sdf_tile_bytes + rid_tile_bytes;
         let mut count = 0u32;
@@ -885,13 +891,13 @@ impl SdfTileManager {
                         .build(),
                 )
                 .image_offset(vk::Offset3D {
-                    x: (slot_x * TILE_RESOLUTION) as i32,
-                    y: (slot_y * TILE_RESOLUTION) as i32,
+                    x: (slot_x * TILE_SLOT_SIZE) as i32,
+                    y: (slot_y * TILE_SLOT_SIZE) as i32,
                     z: 0,
                 })
                 .image_extent(vk::Extent3D {
-                    width: TILE_RESOLUTION,
-                    height: TILE_RESOLUTION,
+                    width: TILE_SLOT_SIZE,
+                    height: TILE_SLOT_SIZE,
                     depth: 1,
                 })
                 .build();
@@ -972,7 +978,7 @@ impl SdfTileManager {
             world_origin,
             world_size,
             TILE_SIZE,
-            TILE_RESOLUTION,
+            TILE_SLOT_SIZE,
             ROAD_ID_RESOLUTION,
         )
         .map_err(|e| anyhow::anyhow!("failed to create tile cache: {}", e))?;
@@ -986,7 +992,7 @@ impl SdfTileManager {
         let total_slots = (self.atlas_tiles_dim * self.atlas_tiles_dim) as usize;
 
         // Readback buffers for the full atlas
-        let sdf_atlas_px = (self.atlas_tiles_dim * TILE_RESOLUTION) as usize;
+        let sdf_atlas_px = (self.atlas_tiles_dim * TILE_SLOT_SIZE) as usize;
         let sdf_readback_bytes = (sdf_atlas_px * sdf_atlas_px * 4) as u64;
         let (sdf_rb, sdf_rb_ptr) = GpuBuffer::new_mapped(
             allocator,
@@ -1172,13 +1178,12 @@ impl SdfTileManager {
                 let slot_x = slot % self.atlas_tiles_dim;
                 let slot_y = slot / self.atlas_tiles_dim;
 
-                // Extract SDF tile
-                let sdf_tile_row = (TILE_RESOLUTION as usize) * sdf_bpp;
-                let mut sdf_data =
-                    vec![0u8; (TILE_RESOLUTION * TILE_RESOLUTION) as usize * sdf_bpp];
-                let sdf_origin_x = (slot_x * TILE_RESOLUTION) as usize;
-                let sdf_origin_y = (slot_y * TILE_RESOLUTION) as usize;
-                for row in 0..TILE_RESOLUTION as usize {
+                // Extract SDF tile (including border)
+                let sdf_tile_row = (TILE_SLOT_SIZE as usize) * sdf_bpp;
+                let mut sdf_data = vec![0u8; (TILE_SLOT_SIZE * TILE_SLOT_SIZE) as usize * sdf_bpp];
+                let sdf_origin_x = (slot_x * TILE_SLOT_SIZE) as usize;
+                let sdf_origin_y = (slot_y * TILE_SLOT_SIZE) as usize;
+                for row in 0..TILE_SLOT_SIZE as usize {
                     let src = (sdf_origin_y + row) * sdf_row_pitch + sdf_origin_x * sdf_bpp;
                     let dst = row * sdf_tile_row;
                     unsafe {

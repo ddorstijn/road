@@ -1,4 +1,5 @@
 use gpu_shared::{GpuLane, GpuLaneSection, GpuRoad, GpuTileInstance};
+use spirv_std::arch::Derivative;
 use spirv_std::glam::{Mat4, Vec2, Vec3, Vec4};
 use spirv_std::image::Image2d;
 use spirv_std::spirv;
@@ -149,6 +150,11 @@ pub fn fs_main(
         alpha = 1.0 - smoothstep(0.0, 1.0, shoulder_t);
     }
 
+    // Compute screen-space pixel width from the smooth signed_dist
+    // (not from abs()-derived values, which have derivative discontinuities).
+    // Clamped to prevent bleeding across the road.
+    let sdf_pixel_w = signed_dist.fwidth().min(MARKING_HALF_WIDTH * 2.0);
+
     // Marking pass: iterate lane boundaries on this side
     let mut best_marking_vis = 0.0f32;
     let mut best_marking_color = WHITE;
@@ -161,7 +167,7 @@ pub fn fs_main(
 
         if lane.marking_type != 0 {
             let boundary_dist = (abs_dist - outer_edge).abs();
-            let mut vis = marking_visibility(boundary_dist);
+            let mut vis = marking_visibility(boundary_dist, sdf_pixel_w);
 
             if is_dashed(lane.marking_type) {
                 if s_mod_period > DASH_LENGTH {
@@ -179,13 +185,10 @@ pub fn fs_main(
         j += 1;
     }
 
-    // Center line (double solid yellow)
-    let center_gap = 0.06f32;
-    let d1 = (signed_dist - center_gap).abs();
-    let d2 = (signed_dist + center_gap).abs();
-    let c1 = marking_visibility(d1);
-    let c2 = marking_visibility(d2);
-    let center_vis = c1.max(c2);
+    // Center line (single solid yellow at signed_dist = 0).
+    // The double-line at ±0.06m is unresolvable at 1m/texel SDF, so
+    // we just check distance to zero using the same clamped pixel width.
+    let center_vis = marking_visibility(signed_dist.abs(), sdf_pixel_w);
 
     if center_vis > best_marking_vis {
         best_marking_vis = center_vis;
@@ -199,12 +202,27 @@ pub fn fs_main(
 }
 
 #[inline]
-fn marking_visibility(dist_to_boundary: f32) -> f32 {
-    1.0 - smoothstep(
-        MARKING_HALF_WIDTH - MARKING_AA,
-        MARKING_HALF_WIDTH + MARKING_AA,
-        dist_to_boundary,
-    )
+fn marking_visibility(dist_to_boundary: f32, sdf_pixel_w: f32) -> f32 {
+    // Widen the AA band when zoomed out so markings stay visible as
+    // thin lines instead of vanishing below pixel resolution.
+    let aa = MARKING_AA.max(sdf_pixel_w);
+    // Clamp lower bound to 0 so marking centers always reach full visibility.
+    let vis = 1.0
+        - smoothstep(
+            (MARKING_HALF_WIDTH - aa).max(0.0),
+            MARKING_HALF_WIDTH + aa,
+            dist_to_boundary,
+        );
+    // At far zoom, snap to fully visible or invisible to prevent gray markings.
+    if sdf_pixel_w > MARKING_AA {
+        if vis > 0.25 {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        vis
+    }
 }
 
 #[inline]

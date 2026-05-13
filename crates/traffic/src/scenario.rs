@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use road::fitting::ControlPoint;
 use road::network::{Road, RoadNetwork};
 use serde::Deserialize;
@@ -12,6 +12,15 @@ pub struct ScenarioCar {
     pub s: f32,
     pub speed: f32,
     pub desired_speed: f32,
+    /// Per-car preferred time headway (seconds). Defaults to global IDM_TIME_HEADWAY.
+    /// Part of the driver profile: aggressive drivers use lower values (~0.8),
+    /// cautious drivers use higher values (~2.5).
+    #[serde(default = "default_preferred_headway")]
+    pub preferred_headway: f32,
+}
+
+fn default_preferred_headway() -> f32 {
+    1.5
 }
 
 #[derive(Debug, Deserialize)]

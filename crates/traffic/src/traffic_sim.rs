@@ -137,6 +137,7 @@ pub struct TrafficSim {
     car_lane_buf: Option<GpuBuffer>,
     car_speed_buf: Option<GpuBuffer>,
     car_desired_speed_buf: Option<GpuBuffer>,
+    car_preferred_headway_buf: Option<GpuBuffer>,
     road_lengths_buf: Option<GpuBuffer>,
 
     // Sort buffers (ping-pong)
@@ -172,6 +173,7 @@ impl Default for TrafficSim {
             car_lane_buf: None,
             car_speed_buf: None,
             car_desired_speed_buf: None,
+            car_preferred_headway_buf: None,
             road_lengths_buf: None,
 
             sort_keys_a_buf: None,
@@ -257,12 +259,12 @@ impl TrafficSim {
             1,
         )?);
 
-        // MOBIL lane change (8 SSBOs: car SoA + road_lengths + sorted_indices + road_lane_counts)
+        // MOBIL lane change (9 SSBOs: car SoA + preferred_headway + road_lengths + sorted_indices + road_lane_counts)
         self.mobil_pass = Some(ComputePass::new(
             device,
             &spirv,
             "traffic_lane_change::traffic_lane_change_main",
-            8,
+            9,
             std::mem::size_of::<MobilPushConstants>() as u32,
             1,
         )?);
@@ -298,6 +300,7 @@ impl TrafficSim {
         let (lane_buf, lane_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
         let (speed_buf, speed_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
         let (desired_buf, desired_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
+        let (headway_buf, headway_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
 
         // Fill with random car data
         let mut rng = rand::rng();
@@ -306,6 +309,7 @@ impl TrafficSim {
         let lane_vals = unsafe { std::slice::from_raw_parts_mut(lane_ptr as *mut i32, n) };
         let speed_vals = unsafe { std::slice::from_raw_parts_mut(speed_ptr as *mut f32, n) };
         let desired_vals = unsafe { std::slice::from_raw_parts_mut(desired_ptr as *mut f32, n) };
+        let headway_vals = unsafe { std::slice::from_raw_parts_mut(headway_ptr as *mut f32, n) };
 
         for i in 0..n {
             let road_idx = (i as u32) % num_roads;
@@ -339,6 +343,7 @@ impl TrafficSim {
             let desired_speed = (30.0 + rng.random_range(-10.0f32..10.0)).clamp(15.0, 45.0);
             desired_vals[i] = desired_speed;
             speed_vals[i] = desired_speed * rng.random_range(0.7f32..1.0);
+            headway_vals[i] = IDM_TIME_HEADWAY;
         }
 
         // Road lengths buffer
@@ -356,6 +361,7 @@ impl TrafficSim {
         self.car_lane_buf = Some(lane_buf);
         self.car_speed_buf = Some(speed_buf);
         self.car_desired_speed_buf = Some(desired_buf);
+        self.car_preferred_headway_buf = Some(headway_buf);
         self.road_lengths_buf = Some(lengths_buf);
 
         // Allocate sort buffers (always MAX_CARS to avoid reallocation)
@@ -408,12 +414,14 @@ impl TrafficSim {
         let (lane_buf, lane_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
         let (speed_buf, speed_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
         let (desired_buf, desired_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
+        let (headway_buf, headway_ptr) = GpuBuffer::new_mapped(allocator, (n * 4) as u64, usage)?;
 
         let road_ids = unsafe { std::slice::from_raw_parts_mut(road_id_ptr as *mut u32, n) };
         let s_vals = unsafe { std::slice::from_raw_parts_mut(s_ptr as *mut f32, n) };
         let lane_vals = unsafe { std::slice::from_raw_parts_mut(lane_ptr as *mut i32, n) };
         let speed_vals = unsafe { std::slice::from_raw_parts_mut(speed_ptr as *mut f32, n) };
         let desired_vals = unsafe { std::slice::from_raw_parts_mut(desired_ptr as *mut f32, n) };
+        let headway_vals = unsafe { std::slice::from_raw_parts_mut(headway_ptr as *mut f32, n) };
 
         for (i, car) in cars.iter().take(n).enumerate() {
             road_ids[i] = car.road_id as u32;
@@ -421,6 +429,7 @@ impl TrafficSim {
             lane_vals[i] = car.lane;
             speed_vals[i] = car.speed;
             desired_vals[i] = car.desired_speed;
+            headway_vals[i] = car.preferred_headway;
         }
 
         // Road lengths buffer
@@ -438,6 +447,7 @@ impl TrafficSim {
         self.car_lane_buf = Some(lane_buf);
         self.car_speed_buf = Some(speed_buf);
         self.car_desired_speed_buf = Some(desired_buf);
+        self.car_preferred_headway_buf = Some(headway_buf);
         self.road_lengths_buf = Some(lengths_buf);
 
         // Allocate sort buffers (always MAX_CARS to avoid reallocation)
@@ -496,6 +506,10 @@ impl TrafficSim {
             None => return,
         };
         let car_desired = match &self.car_desired_speed_buf {
+            Some(b) => b,
+            None => return,
+        };
+        let car_headway = match &self.car_preferred_headway_buf {
             Some(b) => b,
             None => return,
         };
@@ -622,7 +636,7 @@ impl TrafficSim {
             );
         }
 
-        // MOBIL: bindings 0-7 = car SoA + road_lengths + sorted_indices + road_lane_counts
+        // MOBIL: bindings 0-8 = car SoA + preferred_headway + road_lengths + sorted_indices + road_lane_counts
         if let Some(pass) = &self.mobil_pass
             && let Some(lane_counts) = road_lane_counts_buf
         {
@@ -639,6 +653,7 @@ impl TrafficSim {
                     road_lengths,
                     sort_vals_a,
                     lane_counts,
+                    car_headway,
                 ],
             );
         }
@@ -954,6 +969,7 @@ impl TrafficSim {
             &mut self.car_lane_buf,
             &mut self.car_speed_buf,
             &mut self.car_desired_speed_buf,
+            &mut self.car_preferred_headway_buf,
             &mut self.road_lengths_buf,
             &mut self.sort_keys_a_buf,
             &mut self.sort_keys_b_buf,

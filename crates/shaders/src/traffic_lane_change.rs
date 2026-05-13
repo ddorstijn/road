@@ -181,7 +181,7 @@ fn find_follower_in_lane(
         if l == target_lane {
             passed_target = true;
             let g = directional_follower_gap(s, car_s[idx], road_len, is_left, pc.car_length);
-            if g >= 0.0 && g < best_gap {
+            if g < best_gap {
                 best_gap = g;
                 best_speed = car_speed[idx];
                 best_desired = car_desired_speed[idx];
@@ -207,8 +207,9 @@ fn find_follower_in_lane(
                 let l = car_lane[idx];
                 if l == target_lane {
                     passed_target = true;
-                    let g = directional_follower_gap(s, car_s[idx], road_len, is_left, pc.car_length);
-                    if g >= 0.0 && g < best_gap {
+                    let g =
+                        directional_follower_gap(s, car_s[idx], road_len, is_left, pc.car_length);
+                    if g < best_gap {
                         best_gap = g;
                         best_speed = car_speed[idx];
                         best_desired = car_desired_speed[idx];
@@ -241,6 +242,7 @@ pub fn traffic_lane_change_main(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] road_total_lengths: &[f32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] sorted_indices: &[u32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] road_lane_counts: &[UVec2],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 8)] car_preferred_headway: &[f32],
 ) {
     let sorted_idx = gid.x;
     if sorted_idx >= pc.car_count {
@@ -260,6 +262,7 @@ pub fn traffic_lane_change_main(
     let speed = car_speed[car_idx];
     let desired_speed = car_desired_speed[car_idx];
     let road_len = road_total_lengths[road_id as usize];
+    let preferred_headway = car_preferred_headway[car_idx];
 
     let lane_counts = road_lane_counts[road_id as usize];
     let max_right = lane_counts.x as i32;
@@ -285,7 +288,7 @@ pub fn traffic_lane_change_main(
     let mut best_lane = lane;
     let mut best_incentive = 0.0f32;
 
-    let min_gap = (pc.car_length * 2.0).max(speed * pc.time_headway);
+    let min_gap = (pc.car_length * 2.0).max(speed * preferred_headway);
 
     let mut dir = -1i32;
     while dir <= 1 {
@@ -357,10 +360,16 @@ pub fn traffic_lane_change_main(
 
         let is_rightward = (lane >= 0 && target_lane > lane) || (lane < 0 && target_lane < lane);
 
-        // Follower clearance: relaxed for rightward returns (follower is behind
-        // and slower), stricter for leftward overtakes (don't cut off faster car)
+        // Only consider overtaking when actually slowed below desired speed
+        if !is_rightward && speed >= desired_speed * 0.98 {
+            dir += 2;
+            continue;
+        }
+
+        // Follower clearance: use speed-dependent gap for rightward returns so we
+        // don't merge back until the passed car has a comfortable headway.
         let follower_clearance = if is_rightward {
-            pc.car_length * 3.0
+            (follower_speed * preferred_headway + pc.car_length).max(pc.car_length * 3.0)
         } else {
             min_gap
         };
@@ -370,7 +379,7 @@ pub fn traffic_lane_change_main(
         }
 
         // Don't return right if slower car close ahead
-        let keep_left_dist = speed * pc.time_headway * 3.0 + pc.car_length * 4.0;
+        let keep_left_dist = speed * preferred_headway * 3.0 + pc.car_length * 4.0;
         if is_rightward && tgt_leader.x < keep_left_dist && tgt_leader.y < speed * 0.85 {
             dir += 2;
             continue;

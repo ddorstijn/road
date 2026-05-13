@@ -105,8 +105,9 @@ pub fn fs_main(
         spirv_std::arch::kill();
     }
 
-    // Anti-aliased edge
-    let aa = body_sdf.fwidth();
+    // Anti-aliased edge — clamp fwidth so the AA band never exceeds
+    // ~5% of UV space (prevents blobby edges when zoomed out far).
+    let aa = body_sdf.fwidth().clamp(0.001, 0.05);
     let edge_alpha = 1.0 - smoothstep(-aa * 1.5, 0.0, body_sdf);
 
     // Outline: darken near edge
