@@ -1,6 +1,6 @@
 // GPU frustum culling: tile culling compute shader
 
-import gpu_shared;
+import "generated/gpu_shared";
 
 struct TileCullPushConstants {
     float view_min_x;

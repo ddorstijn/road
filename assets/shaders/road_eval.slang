@@ -1,7 +1,7 @@
 // Road evaluation functions shared between GPU shaders.
 // Replicates the math from crates/road/src/primitives.rs.
 
-import gpu_shared;
+import "generated/gpu_shared";
 
 struct PoseResult {
     float2 position;

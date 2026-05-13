@@ -1,6 +1,6 @@
 // Road surface rendering with lane markings from SDF atlas
 
-import gpu_shared;
+import "generated/gpu_shared";
 
 struct PushConstants {
     float4x4 view_proj;

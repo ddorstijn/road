@@ -1,6 +1,6 @@
 // Car rendering — instanced vertex + fragment shader
 
-import gpu_shared;
+import "generated/gpu_shared";
 import road_eval;
 
 struct PushConstants {

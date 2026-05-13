@@ -1,10 +1,84 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Parse `crates/gpu-shared/src/types.rs` and generate an equivalent `gpu_shared.slang`.
+/// This keeps the Rust types as the single source of truth.
+fn generate_gpu_shared_slang(out_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let types_rs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gpu-shared/src/types.rs");
+    println!("cargo:rerun-if-changed={}", types_rs.display());
+
+    let source = std::fs::read_to_string(&types_rs)?;
+    let mut slang = String::from(
+        "// AUTO-GENERATED from crates/gpu-shared/src/types.rs \u{2014} do not edit.\n\n",
+    );
+
+    let mut in_struct = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("pub struct ") {
+            let name = trimmed
+                .strip_prefix("pub struct ")
+                .unwrap()
+                .trim_end_matches(" {")
+                .trim();
+            slang.push_str(&format!("struct {} {{\n", name));
+            in_struct = true;
+            continue;
+        }
+
+        if in_struct && trimmed == "}" {
+            slang.push_str("};\n\n");
+            in_struct = false;
+            continue;
+        }
+
+        if in_struct && trimmed.starts_with("pub ") {
+            let field = trimmed.strip_prefix("pub ").unwrap().trim_end_matches(',');
+            if let Some((name, ty)) = field.split_once(": ") {
+                let slang_ty = rust_type_to_slang(ty.trim());
+                slang.push_str(&format!("    {} {};\n", slang_ty, name.trim()));
+            }
+            continue;
+        }
+
+        if in_struct && trimmed.starts_with("///") {
+            let comment = trimmed.strip_prefix("///").unwrap_or("");
+            slang.push_str(&format!("    //{}\n", comment));
+        }
+    }
+
+    std::fs::write(out_dir.join("gpu_shared.slang"), slang)?;
+    Ok(())
+}
+
+fn rust_type_to_slang(ty: &str) -> &str {
+    match ty {
+        "u32" => "uint",
+        "i32" => "int",
+        "f32" => "float",
+        "[f32; 2]" => "float2",
+        "[f32; 3]" => "float3",
+        "[f32; 4]" => "float4",
+        "[u32; 2]" => "uint2",
+        "[u32; 3]" => "uint3",
+        "[u32; 4]" => "uint4",
+        _ => panic!(
+            "Unsupported type in gpu-shared types.rs: `{ty}` \u{2014} add a mapping in build.rs"
+        ),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
     let shader_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/shaders");
     let shader_dir_str = shader_dir.to_str().unwrap();
+
+    // Generate gpu_shared.slang from Rust types (single source of truth)
+    let generated_dir = shader_dir.join("generated");
+    std::fs::create_dir_all(&generated_dir)?;
+    generate_gpu_shared_slang(&generated_dir)?;
 
     // Each entry: (module_filename, entry_point_name, env_var_name)
     let shaders: &[(&str, &str, &str)] = &[

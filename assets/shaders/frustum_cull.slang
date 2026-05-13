@@ -1,6 +1,6 @@
 // GPU frustum culling: car culling compute shader
 
-import gpu_shared;
+import "generated/gpu_shared";
 import road_eval;
 
 struct CarCullPushConstants {
