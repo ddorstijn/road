@@ -7,38 +7,20 @@ resolver = "2"
 edition = "2021"
 keywords = ["vulkan", "bindings", "graphics", "gpu", "rendering"]
 
-# Workaround for MSVC LNK1189 (65535 COFF section limit) when linking rustc_codegen_spirv.
-# The codegen backend is compiled as a dylib, and at opt-level 0 the un-inlined functions
-# produce enough COFF sections to exceed the limit. Setting opt-level = 2 for the package
-# (and codegen-units = 1 for build deps) keeps the section count under the limit.
+# Compile build-dependencies in release mode so rustc_codegen_spirv is optimized
+# for fast shader compilation. Also avoids MSVC LNK1189 (COFF section limit).
 [profile.dev.build-override]
-codegen-units = 1
-
-[profile.dev.package.rustc_codegen_spirv]
-opt-level = 2
-codegen-units = 1
-
-# Optimized build for GPU profiling (RGP etc). Release-level optimization for the app,
-# build deps at opt-level 0, but rustc_codegen_spirv itself at opt-level 2 (see above).
-[profile.profiling]
-inherits = "dev"
 opt-level = 3
-debug = 1
-
-[profile.profiling.build-override]
-opt-level = 0
-codegen-units = 1
-
-[profile.profiling.package.rustc_codegen_spirv]
-opt-level = 2
-codegen-units = 1
 
 [profile.release]
 codegen-units = 1
 
 [profile.release.build-override]
-codegen-units = 1
+opt-level = 3
+codegen-units = 16
 
-[profile.release.package.rustc_codegen_spirv]
-opt-level = 2
-codegen-units = 1
+# Optimized build for GPU profiling (RGP etc).
+[profile.profiling]
+inherits = "dev"
+opt-level = 3
+debug = 1
