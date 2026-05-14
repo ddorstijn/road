@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod car_renderer;
 pub mod core;
+pub mod egui_renderer;
 pub mod frustum_cull;
 pub mod gpu_pipeline_stats;
 pub mod gpu_resources;
@@ -30,6 +31,7 @@ use crate::gpu_resources::GpuImage;
 // Public re-exports for convenience
 // ---------------------------------------------------------------------------
 
+pub use egui;
 pub use vulkanalia::{vk, vk::DeviceV1_0, vk::DeviceV1_3, vk::Handle, vk::HasBuilder};
 pub use vulkanalia_bootstrap::Device as VkDevice;
 pub use vulkanalia_vma as vma;
@@ -72,6 +74,9 @@ pub trait App {
     /// Called every frame. Record GPU commands into `cmd`.
     /// The draw image is already in GENERAL layout, ready for compute writes.
     fn render(&mut self, ctx: &EngineContext, cmd: vk::CommandBuffer) -> anyhow::Result<()>;
+
+    /// Called every frame to build egui UI. Override to add panels, windows, etc.
+    fn ui(&mut self, _egui_ctx: &egui::Context, _ctx: &EngineContext) {}
 
     /// Called on shutdown, before Vulkan resources are destroyed.
     fn shutdown(&mut self, _ctx: &EngineContext) {}
@@ -127,6 +132,13 @@ struct EngineRunner<A: App> {
     camera: Camera2D,
     last_frame_time: Option<Instant>,
     dt: f32,
+    // egui state
+    egui_ctx: egui::Context,
+    egui_state: Option<egui_winit::State>,
+    egui_renderer: Option<egui_renderer::EguiRenderer>,
+    /// Cached egui output for the current frame (set before draw_frame, consumed inside).
+    egui_clipped_primitives: Vec<egui::ClippedPrimitive>,
+    egui_textures_delta: egui::TexturesDelta,
 }
 
 impl<A: App> EngineRunner<A> {
@@ -139,6 +151,11 @@ impl<A: App> EngineRunner<A> {
             camera: Camera2D::default(),
             last_frame_time: None,
             dt: 0.0,
+            egui_ctx: egui::Context::default(),
+            egui_state: None,
+            egui_renderer: None,
+            egui_clipped_primitives: Vec::new(),
+            egui_textures_delta: egui::TexturesDelta::default(),
         }
     }
 }
@@ -152,6 +169,25 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
         );
 
         let core = Core::new(window.clone()).expect("Failed to initialize Vulkan");
+
+        // Initialize egui
+        let egui_state = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            None,
+            None,
+            None,
+        );
+        let egui_renderer = egui_renderer::EguiRenderer::new(
+            core.device(),
+            core.allocator(),
+            core.draw_image().format,
+        )
+        .expect("Failed to create egui renderer");
+
+        self.egui_state = Some(egui_state);
+        self.egui_renderer = Some(egui_renderer);
         self.core = Some(core);
         self.window = Some(window);
 
@@ -182,6 +218,16 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Forward events to egui first
+        let egui_consumed = if let (Some(egui_state), Some(window)) =
+            (self.egui_state.as_mut(), self.window.as_ref())
+        {
+            let response = egui_state.on_window_event(window, &event);
+            response.consumed
+        } else {
+            false
+        };
+
         match event {
             WindowEvent::CloseRequested => {
                 if let Some(core) = &self.core {
@@ -204,6 +250,9 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                         graphics_queue_family: core.graphics_queue_family(),
                     };
                     self.app.shutdown(&ctx);
+                    if let Some(mut r) = self.egui_renderer.take() {
+                        r.destroy(core.device(), core.allocator());
+                    }
                 }
                 event_loop.exit();
             }
@@ -231,14 +280,21 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                 }
             }
 
-            WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::CursorMoved { position, .. } if !egui_consumed => {
                 self.input.mouse_dx += position.x - self.input.mouse_x;
                 self.input.mouse_dy += position.y - self.input.mouse_y;
                 self.input.mouse_x = position.x;
                 self.input.mouse_y = position.y;
             }
 
-            WindowEvent::MouseInput { state, button, .. } => {
+            // Always track cursor position for camera zoom-at-cursor, even when
+            // egui has focus. Only mouse *actions* are suppressed.
+            WindowEvent::CursorMoved { position, .. } => {
+                self.input.mouse_x = position.x;
+                self.input.mouse_y = position.y;
+            }
+
+            WindowEvent::MouseInput { state, button, .. } if !egui_consumed => {
                 let pressed = state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => {
@@ -258,14 +314,14 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                 }
             }
 
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !egui_consumed => {
                 self.input.scroll_delta += match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 100.0,
                 };
             }
 
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, .. } if !egui_consumed => {
                 use winit::keyboard::{Key, NamedKey};
                 if event.state == ElementState::Pressed {
                     if event.logical_key == Key::Named(NamedKey::Escape) {
@@ -345,6 +401,13 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                         self.camera.zoom_at(self.input.scroll_delta, cursor_world);
                     }
 
+                    // --- egui frame ---
+                    let egui_input = self
+                        .egui_state
+                        .as_mut()
+                        .unwrap()
+                        .take_egui_input(self.window.as_ref().unwrap());
+
                     let input = &self.input;
                     let camera = &self.camera;
                     let dt = self.dt;
@@ -357,7 +420,44 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                     let gfx_queue = core.graphics_queue();
                     let gfx_queue_family = core.graphics_queue_family();
 
-                    core.draw_frame(|_device, cmd, _draw_image| {
+                    // Run egui — app builds its UI here
+                    let full_output = self.egui_ctx.run(egui_input, |egui_ctx| {
+                        let ctx = EngineContext {
+                            device: &device_ref,
+                            allocator: unsafe { &*allocator_ref },
+                            draw_image: unsafe { &*draw_image_ref },
+                            input,
+                            camera,
+                            dt,
+                            window_width: window_extent.width,
+                            window_height: window_extent.height,
+                            frame_number,
+                            window: window_ref,
+                            timestamp_period,
+                            graphics_queue: gfx_queue,
+                            graphics_queue_family: gfx_queue_family,
+                        };
+                        self.app.ui(egui_ctx, &ctx);
+                    });
+
+                    let pixels_per_point = full_output.pixels_per_point;
+                    self.egui_clipped_primitives = self
+                        .egui_ctx
+                        .tessellate(full_output.shapes, pixels_per_point);
+                    self.egui_textures_delta = full_output.textures_delta;
+
+                    self.egui_state.as_mut().unwrap().handle_platform_output(
+                        self.window.as_ref().unwrap(),
+                        full_output.platform_output,
+                    );
+
+                    let screen_size = [window_extent.width, window_extent.height];
+                    let egui_prims = &self.egui_clipped_primitives;
+                    let egui_tex_delta = &self.egui_textures_delta;
+                    let egui_renderer = self.egui_renderer.as_mut().unwrap();
+                    let frame_idx = core.frame_number();
+
+                    core.draw_frame(|device, cmd, _draw_image| {
                         let ctx = EngineContext {
                             device: &device_ref,
                             allocator: unsafe { &*allocator_ref },
@@ -374,6 +474,25 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                             graphics_queue_family: gfx_queue_family,
                         };
                         self.app.render(&ctx, cmd).expect("App::render failed");
+
+                        // egui rendering (after scene, before blit)
+                        egui_renderer
+                            .update_textures(
+                                device,
+                                unsafe { &*allocator_ref },
+                                cmd,
+                                egui_tex_delta,
+                            )
+                            .expect("egui texture update failed");
+                        egui_renderer.paint(
+                            device,
+                            cmd,
+                            unsafe { &*draw_image_ref },
+                            egui_prims,
+                            screen_size,
+                            pixels_per_point,
+                            frame_idx,
+                        );
                     })
                     .expect("draw_frame failed");
 

@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 anyhow = "1.0.100"
 bytemuck = { version = "1.25", features = ["derive"] }
+egui = "0.31"
+egui-winit = "0.31"
 glam = { version = "0.32.0", features = ["bytemuck"] }
 gpu-shared = { path = "../gpu-shared" }
 log = "0.4"

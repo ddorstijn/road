@@ -1438,10 +1438,37 @@ impl App for TrafficApp {
         // Phase: Scene rendering (roads, polylines, cars)
         self.draw_scene(ctx, cmd);
 
-        // HUD
+        // HUD (keep simple window title)
         self.update_hud(ctx);
 
         Ok(())
+    }
+
+    fn ui(&mut self, egui_ctx: &engine::egui::Context, ctx: &EngineContext) {
+        engine::egui::Window::new("Debug")
+            .default_pos([8.0, 8.0])
+            .default_width(220.0)
+            .resizable(false)
+            .show(egui_ctx, |ui| {
+                ui.label(format!("FPS: {:.0}", self.fps_display));
+                ui.label(format!("Frame time: {:.2} ms", ctx.dt * 1000.0));
+                ui.separator();
+                ui.label(format!("Cars: {}", self.traffic.car_count));
+                ui.label(format!("Roads: {}", self.network.roads.len()));
+                ui.separator();
+                ui.label(format!(
+                    "Camera: ({:.2}, {:.2})",
+                    ctx.camera.position.x, ctx.camera.position.y
+                ));
+                ui.label(format!("Zoom: {:.2}", ctx.camera.zoom));
+                ui.separator();
+                let speed_label = if self.sim_speed == 0.0 {
+                    "PAUSED".to_string()
+                } else {
+                    format!("{:.1}x", self.sim_speed)
+                };
+                ui.label(format!("Speed: {}", speed_label));
+            });
     }
 
     fn shutdown(&mut self, ctx: &EngineContext) {
