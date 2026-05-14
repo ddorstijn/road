@@ -120,7 +120,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ];
 
-    // Use debug info + no optimization for dev builds, optimized for release
+    // Use no optimization for dev builds, optimized for release.
+    // Note: `-g` (SPIR-V debug info via SPV_KHR_non_semantic_info) is intentionally
+    // omitted because AMD's shader compiler crashes on NonSemantic.Shader.DebugInfo
+    // instructions. Use spirv-opt --strip-nonsemantic if debug info is needed on NVIDIA.
     let is_release = std::env::var("PROFILE").unwrap_or_default() == "release";
 
     for &(module_name, entry_name, env_name) in shaders {
@@ -137,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if is_release {
             cmd.arg("-O3");
         } else {
-            cmd.args(["-O0", "-g"]);
+            cmd.arg("-O0");
         }
 
         let output = cmd
@@ -152,6 +155,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "slangc failed for {}::{}\nstdout: {}\nstderr: {}",
                 module_name, entry_name, stdout, stderr
             );
+        }
+
+        // Validate SPIR-V with spirv-val (catches issues that crash certain drivers)
+        if let Ok(val_output) = Command::new("spirv-val").arg(out_path.to_str().unwrap()).output() {
+            if !val_output.status.success() {
+                let stderr = String::from_utf8_lossy(&val_output.stderr);
+                panic!(
+                    "spirv-val failed for {}::{}\n{}",
+                    module_name, entry_name, stderr
+                );
+            }
         }
 
         println!("cargo:rustc-env={}={}", env_name, out_path.display());

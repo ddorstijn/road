@@ -63,14 +63,9 @@ impl Core {
             .require_api_version(Version::new(1, 3, 0))
             .build()?;
 
-        let features11 = vk::PhysicalDeviceVulkan11Features::builder()
-            .shader_draw_parameters(true);
+        let features11 = vk::PhysicalDeviceVulkan11Features::builder().shader_draw_parameters(true);
 
-        let features12 = vk::PhysicalDeviceVulkan12Features::builder()
-            .buffer_device_address(true)
-            .descriptor_indexing(true)
-            .vulkan_memory_model(true)
-            .vulkan_memory_model_device_scope(true);
+        let features12 = vk::PhysicalDeviceVulkan12Features::builder();
 
         let features13 = vk::PhysicalDeviceVulkan13Features::builder()
             .synchronization2(true)
@@ -92,11 +87,12 @@ impl Core {
         let device = Arc::new(DeviceBuilder::new(physical_device, instance.clone()).build()?);
 
         // --- VMA allocator ---
-        let allocator_options = vma::AllocatorOptions::new(
+        let mut allocator_options = vma::AllocatorOptions::new(
             instance.as_ref().as_ref(),
             device.as_ref(),
             *device.physical_device().as_ref(),
         );
+        allocator_options.version = Version::new(1, 3, 0);
         let allocator = unsafe { vma::Allocator::new(&allocator_options) }?;
 
         // --- Queue ---

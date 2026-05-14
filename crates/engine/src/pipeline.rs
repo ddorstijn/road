@@ -15,10 +15,27 @@ static VK_PIPELINE_CACHE: Mutex<Option<vk::PipelineCache>> = Mutex::new(None);
 const PIPELINE_CACHE_FILE: &str = "target/shader_cache/vk_pipeline_cache.bin";
 
 /// Create and store a global Vulkan pipeline cache, loading previous data from disk if available.
+/// If the existing cache data is rejected by the driver (e.g. different GPU or corrupt file),
+/// falls back to an empty cache.
 pub fn init_pipeline_cache(device: &Device) -> anyhow::Result<()> {
     let initial_data = fs::read(PIPELINE_CACHE_FILE).unwrap_or_default();
-    let info = vk::PipelineCacheCreateInfo::builder().initial_data(&initial_data);
-    let cache = unsafe { device.create_pipeline_cache(&info, None)? };
+
+    let cache = if !initial_data.is_empty() {
+        let info = vk::PipelineCacheCreateInfo::builder().initial_data(&initial_data);
+        match unsafe { device.create_pipeline_cache(&info, None) } {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("Failed to load pipeline cache, creating empty cache: {e}");
+                let _ = fs::remove_file(PIPELINE_CACHE_FILE);
+                let info = vk::PipelineCacheCreateInfo::builder();
+                unsafe { device.create_pipeline_cache(&info, None)? }
+            }
+        }
+    } else {
+        let info = vk::PipelineCacheCreateInfo::builder();
+        unsafe { device.create_pipeline_cache(&info, None)? }
+    };
+
     *VK_PIPELINE_CACHE.lock().unwrap() = Some(cache);
     Ok(())
 }
