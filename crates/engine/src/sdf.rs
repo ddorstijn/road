@@ -1364,3 +1364,400 @@ fn eval_segment_xy(seg_type: u32, s: f32, k_start: f32, k_end: f32, length: f32)
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// DraftSdfTile — dedicated single-tile SDF for draft road preview
+// ---------------------------------------------------------------------------
+
+/// Maximum texel resolution for the draft SDF tile (capped for performance).
+const DRAFT_MAX_RESOLUTION: u32 = 256;
+/// Target texels per world meter for the draft tile.
+const DRAFT_TEXELS_PER_METER: f32 = 2.0;
+/// Maximum number of road segments the draft tile can handle.
+const DRAFT_MAX_SEGMENTS: usize = 128;
+
+/// A dedicated small SDF texture for rendering a draft (in-progress) road.
+/// All GPU resources are pre-allocated at max capacity to avoid per-frame
+/// reallocation that would conflict with in-flight command buffers.
+pub struct DraftSdfTile {
+    /// SDF texture (RG16F — signed_dist + s_coord), always DRAFT_MAX_RESOLUTION².
+    pub sdf_image: GpuImage,
+    /// Dummy 1×1 road-ID image (R16F) — satisfies the compute shader binding.
+    road_id_dummy: GpuImage,
+
+    // Compute pipeline
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+
+    // Pre-allocated GPU buffers (persistently mapped)
+    segment_buffer: GpuBuffer,
+    segment_ptr: *mut u8,
+    tile_header_buffer: GpuBuffer,
+    tile_header_ptr: *mut u8,
+    segment_index_buffer: GpuBuffer,
+    segment_index_ptr: *mut u8,
+    road_index_buffer: GpuBuffer,
+    road_index_ptr: *mut u8,
+
+    /// World-space origin (bottom-left) of the tile.
+    pub world_origin: [f32; 2],
+    /// World-space size of the tile.
+    pub world_size: [f32; 2],
+    /// Current image layout.
+    pub layout: vk::ImageLayout,
+}
+
+impl DraftSdfTile {
+    /// Create a new draft SDF tile with all resources pre-allocated at max capacity.
+    pub fn new(
+        device: &Arc<Device>,
+        allocator: &vma::Allocator,
+        spirv: &[u32],
+    ) -> anyhow::Result<Self> {
+        let resolution = DRAFT_MAX_RESOLUTION;
+
+        let sdf_image = GpuImage::new_storage_2d(
+            device,
+            allocator,
+            resolution,
+            resolution,
+            vk::Format::R16G16_SFLOAT,
+        )?;
+
+        let road_id_dummy = GpuImage::new_storage_2d(
+            device,
+            allocator,
+            1,
+            1,
+            vk::Format::R16_SFLOAT,
+        )?;
+
+        // Descriptor set layout — same bindings as main SDF system
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .build(),
+        ];
+
+        let descriptor_set_layout =
+            crate::pipeline::create_descriptor_set_layout(device, &bindings)?;
+
+        let pool_sizes = [
+            vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(2)
+                .build(),
+            vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(4)
+                .build(),
+        ];
+        let pool_info = vk::DescriptorPoolCreateInfo::builder()
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+        let descriptor_set =
+            crate::pipeline::allocate_descriptor_set(device, descriptor_pool, descriptor_set_layout)?;
+
+        let push_constant_ranges = [vk::PushConstantRange::builder()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(std::mem::size_of::<SdfPushConstants>() as u32)
+            .build()];
+
+        let (pipeline, pipeline_layout) = crate::pipeline::create_compute_pipeline(
+            device,
+            spirv,
+            "main",
+            &[descriptor_set_layout],
+            &push_constant_ranges,
+        )?;
+
+        // Write SDF image descriptor (binding 0) and road_id dummy (binding 5)
+        let sdf_image_info = [vk::DescriptorImageInfo::builder()
+            .image_view(sdf_image.view)
+            .image_layout(vk::ImageLayout::GENERAL)
+            .build()];
+        let road_id_image_info = [vk::DescriptorImageInfo::builder()
+            .image_view(road_id_dummy.view)
+            .image_layout(vk::ImageLayout::GENERAL)
+            .build()];
+
+        // Pre-allocate buffers at max capacity (persistently mapped)
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let seg_size = (DRAFT_MAX_SEGMENTS * std::mem::size_of::<gpu_shared::GpuSegment>()) as u64;
+        let hdr_size = std::mem::size_of::<TileHeader>() as u64;
+        let idx_size = (DRAFT_MAX_SEGMENTS * std::mem::size_of::<u32>()) as u64;
+        let rid_size = (DRAFT_MAX_SEGMENTS * std::mem::size_of::<u32>()) as u64;
+
+        let (segment_buffer, segment_ptr) = GpuBuffer::new_mapped(allocator, seg_size, usage)?;
+        let (tile_header_buffer, tile_header_ptr) = GpuBuffer::new_mapped(allocator, hdr_size, usage)?;
+        let (segment_index_buffer, segment_index_ptr) = GpuBuffer::new_mapped(allocator, idx_size, usage)?;
+        let (road_index_buffer, road_index_ptr) = GpuBuffer::new_mapped(allocator, rid_size, usage)?;
+
+        // Write all descriptor bindings once — they never change after this
+        let seg_buf_info = [vk::DescriptorBufferInfo::builder()
+            .buffer(segment_buffer.buffer)
+            .offset(0)
+            .range(seg_size)
+            .build()];
+        let hdr_buf_info = [vk::DescriptorBufferInfo::builder()
+            .buffer(tile_header_buffer.buffer)
+            .offset(0)
+            .range(hdr_size)
+            .build()];
+        let idx_buf_info = [vk::DescriptorBufferInfo::builder()
+            .buffer(segment_index_buffer.buffer)
+            .offset(0)
+            .range(idx_size)
+            .build()];
+        let rid_buf_info = [vk::DescriptorBufferInfo::builder()
+            .buffer(road_index_buffer.buffer)
+            .offset(0)
+            .range(rid_size)
+            .build()];
+
+        let writes = [
+            vk::WriteDescriptorSet::builder()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&sdf_image_info)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(descriptor_set)
+                .dst_binding(1)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&seg_buf_info)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(descriptor_set)
+                .dst_binding(2)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&hdr_buf_info)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(descriptor_set)
+                .dst_binding(3)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&idx_buf_info)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(descriptor_set)
+                .dst_binding(4)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&rid_buf_info)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(descriptor_set)
+                .dst_binding(5)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&road_id_image_info)
+                .build(),
+        ];
+        unsafe {
+            device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
+        }
+
+        Ok(Self {
+            sdf_image,
+            road_id_dummy,
+            pipeline,
+            pipeline_layout,
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_set,
+            segment_buffer,
+            segment_ptr,
+            tile_header_buffer,
+            tile_header_ptr,
+            segment_index_buffer,
+            segment_index_ptr,
+            road_index_buffer,
+            road_index_ptr,
+            world_origin: [0.0; 2],
+            world_size: [1.0; 2],
+            layout: vk::ImageLayout::UNDEFINED,
+        })
+    }
+
+    /// Upload segment data and dispatch the SDF compute shader for the draft road.
+    /// The SDF image must be in GENERAL layout before calling this.
+    pub fn update(
+        &mut self,
+        device: &Arc<Device>,
+        cmd: vk::CommandBuffer,
+        segments: &[RoadSegmentInfo],
+    ) -> anyhow::Result<()> {
+        if segments.is_empty() {
+            return Ok(());
+        }
+
+        let seg_count = segments.len().min(DRAFT_MAX_SEGMENTS);
+        let segments = &segments[..seg_count];
+
+        // Compute AABB from segments
+        let aabbs = compute_segment_aabbs(segments);
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for aabb in &aabbs {
+            min_x = min_x.min(aabb.aabb_min.0);
+            min_y = min_y.min(aabb.aabb_min.1);
+            max_x = max_x.max(aabb.aabb_max.0);
+            max_y = max_y.max(aabb.aabb_max.1);
+        }
+
+        let size_x = (max_x - min_x).max(1.0);
+        let size_y = (max_y - min_y).max(1.0);
+        let tile_size = size_x.max(size_y);
+
+        self.world_origin = [min_x, min_y];
+        self.world_size = [tile_size, tile_size];
+
+        // Build GPU segment data and memcpy into pre-allocated buffers
+        let gpu_segments: Vec<gpu_shared::GpuSegment> = segments
+            .iter()
+            .map(|s| gpu_shared::GpuSegment {
+                segment_type: s.seg_type,
+                s_start: 0.0,
+                origin: [s.origin_x, s.origin_y],
+                heading: s.heading,
+                length: s.length,
+                k_start: s.k_start,
+                k_end: s.k_end,
+            })
+            .collect();
+
+        let seg_data = bytemuck::cast_slice::<_, u8>(&gpu_segments);
+        unsafe { std::ptr::copy_nonoverlapping(seg_data.as_ptr(), self.segment_ptr, seg_data.len()) };
+
+        let header = TileHeader {
+            offset: 0,
+            count: seg_count as u32,
+        };
+        let header_data = bytemuck::bytes_of(&header);
+        unsafe { std::ptr::copy_nonoverlapping(header_data.as_ptr(), self.tile_header_ptr, header_data.len()) };
+
+        let indices: Vec<u32> = (0..seg_count as u32).collect();
+        let idx_data = bytemuck::cast_slice::<_, u8>(&indices);
+        unsafe { std::ptr::copy_nonoverlapping(idx_data.as_ptr(), self.segment_index_ptr, idx_data.len()) };
+
+        let road_ids: Vec<u32> = vec![0; seg_count];
+        let rid_data = bytemuck::cast_slice::<_, u8>(&road_ids);
+        unsafe { std::ptr::copy_nonoverlapping(rid_data.as_ptr(), self.road_index_ptr, rid_data.len()) };
+
+        // Dispatch compute — use actual needed resolution for workgroup count
+        let needed_res = ((tile_size * DRAFT_TEXELS_PER_METER) as u32)
+            .next_power_of_two()
+            .clamp(64, DRAFT_MAX_RESOLUTION);
+
+        let pc = SdfPushConstants {
+            atlas_offset_x: 0,
+            atlas_offset_y: 0,
+            tile_world_x: min_x,
+            tile_world_y: min_y,
+            tile_size,
+            tile_resolution: needed_res,
+            tile_index: 0,
+            road_id_atlas_offset_x: 0,
+            road_id_atlas_offset_y: 0,
+            road_id_resolution: 1,
+            tile_border: 0,
+            _pad: 0,
+        };
+
+        unsafe {
+            // Transition road_id dummy to GENERAL (discards prior content)
+            crate::core::transition_image(
+                device,
+                cmd,
+                self.road_id_dummy.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+            );
+
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[self.descriptor_set],
+                &[],
+            );
+            device.cmd_push_constants(
+                cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&pc),
+            );
+
+            let wg = (needed_res + 15) / 16;
+            device.cmd_dispatch(cmd, wg, wg, 1);
+        }
+
+        Ok(())
+    }
+
+    /// Destroy all GPU resources.
+    pub fn destroy(&mut self, device: &Device, allocator: &vma::Allocator) {
+        self.segment_buffer.destroy(allocator);
+        self.tile_header_buffer.destroy(allocator);
+        self.segment_index_buffer.destroy(allocator);
+        self.road_index_buffer.destroy(allocator);
+        self.sdf_image.destroy(device, allocator);
+        self.road_id_dummy.destroy(device, allocator);
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+        }
+    }
+}

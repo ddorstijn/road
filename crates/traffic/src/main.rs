@@ -10,7 +10,7 @@ use engine::pipeline::{
     GraphicsPipelineDesc, allocate_descriptor_set, create_compute_pipeline,
     create_descriptor_set_layout, create_graphics_pipeline, write_storage_buffers,
 };
-use engine::sdf::{RoadSegmentInfo, SdfTileManager, compute_segment_aabbs};
+use engine::sdf::{DraftSdfTile, RoadSegmentInfo, SdfTileManager, compute_segment_aabbs};
 use engine::vk::{DeviceV1_0, DeviceV1_3, Handle, HasBuilder};
 use engine::{App, EngineContext, transition_image, vk};
 use glam::Vec2;
@@ -42,6 +42,8 @@ pub mod shader_spirv {
     pub const SORT_SCATTER: &[u8] = include_bytes!(env!("SHADER_SORT_SCATTER"));
     pub const TRAFFIC_IDM: &[u8] = include_bytes!(env!("SHADER_TRAFFIC_IDM"));
     pub const TRAFFIC_LANE_CHANGE: &[u8] = include_bytes!(env!("SHADER_TRAFFIC_LANE_CHANGE"));
+    pub const ROAD_DRAFT_VS: &[u8] = include_bytes!(env!("SHADER_ROAD_DRAFT_VS"));
+    pub const ROAD_DRAFT_FS: &[u8] = include_bytes!(env!("SHADER_ROAD_DRAFT_FS"));
 }
 
 pub fn spirv_bytes_to_words(bytes: &[u8]) -> Vec<u32> {
@@ -75,6 +77,18 @@ struct LinePushConstants {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RoadRenderPushConstants {
     view_proj: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DraftPushConstants {
+    view_proj: [[f32; 4]; 4],
+    world_origin: [f32; 2],
+    world_size: [f32; 2],
+    road_half_width: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 #[repr(C)]
@@ -149,6 +163,19 @@ struct TrafficApp {
     /// Set to true after pregeneration has been triggered (one-shot).
     pregenerate_done: bool,
 
+    // Draft road preview
+    draft_reference_line: Option<ReferenceLine>,
+    draft_dirty: bool,
+    draft_sdf: Option<DraftSdfTile>,
+    draft_pipeline: vk::Pipeline,
+    draft_pipeline_layout: vk::PipelineLayout,
+    draft_descriptor_set_layout: vk::DescriptorSetLayout,
+    draft_descriptor_pool: vk::DescriptorPool,
+    draft_descriptor_set: vk::DescriptorSet,
+    draft_sampler: vk::Sampler,
+    draft_last_cursor: Vec2,
+    draft_road_half_width: f32,
+
     // Simulation speed multiplier (0 = paused, 0.5, 1.0, 2.0, 4.0)
     sim_speed: f32,
 
@@ -203,6 +230,18 @@ impl Default for TrafficApp {
 
             sdf_cache_path: None,
             pregenerate_done: false,
+
+            draft_reference_line: None,
+            draft_dirty: false,
+            draft_sdf: None,
+            draft_pipeline: vk::Pipeline::null(),
+            draft_pipeline_layout: vk::PipelineLayout::null(),
+            draft_descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            draft_descriptor_pool: vk::DescriptorPool::null(),
+            draft_descriptor_set: vk::DescriptorSet::null(),
+            draft_sampler: vk::Sampler::null(),
+            draft_last_cursor: Vec2::ZERO,
+            draft_road_half_width: 14.0,
 
             sim_speed: 1.0,
             fps_accumulator: 0.0,
@@ -502,6 +541,122 @@ impl TrafficApp {
         self.sdf_manager = Some(sdf_manager);
         Ok(())
     }
+
+    fn create_draft_pipeline(&mut self, ctx: &EngineContext) -> anyhow::Result<()> {
+        let device = ctx.device.as_ref();
+
+        let vs_spirv = spirv_bytes_to_words(shader_spirv::ROAD_DRAFT_VS);
+        let fs_spirv = spirv_bytes_to_words(shader_spirv::ROAD_DRAFT_FS);
+
+        // Sampler for draft SDF texture (bilinear)
+        let sampler_info = vk::SamplerCreateInfo::builder()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        self.draft_sampler = unsafe { device.create_sampler(&sampler_info, None)? };
+
+        // Descriptor set layout: binding 0 = sampled image, binding 1 = sampler
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+        ];
+        self.draft_descriptor_set_layout = create_descriptor_set_layout(device, &bindings)?;
+
+        let pool_sizes = [
+            vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .build(),
+            vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .build(),
+        ];
+        let pool_info = vk::DescriptorPoolCreateInfo::builder()
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        self.draft_descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+        self.draft_descriptor_set = allocate_descriptor_set(
+            device,
+            self.draft_descriptor_pool,
+            self.draft_descriptor_set_layout,
+        )?;
+
+        // Write sampler descriptor (constant)
+        let sampler_desc = [vk::DescriptorImageInfo::builder()
+            .sampler(self.draft_sampler)
+            .build()];
+        let writes = [vk::WriteDescriptorSet::builder()
+            .dst_set(self.draft_descriptor_set)
+            .dst_binding(1)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .image_info(&sampler_desc)
+            .build()];
+        unsafe {
+            device.update_descriptor_sets(&writes, &[] as &[vk::CopyDescriptorSet]);
+        }
+
+        let push_constant_ranges = [vk::PushConstantRange::builder()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(std::mem::size_of::<DraftPushConstants>() as u32)
+            .build()];
+
+        let desc = GraphicsPipelineDesc {
+            vertex_spirv: &vs_spirv,
+            fragment_spirv: &fs_spirv,
+            vertex_entry: "main",
+            fragment_entry: "main",
+            vertex_binding_descriptions: &[],
+            vertex_attribute_descriptions: &[],
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            color_attachment_format: ctx.draw_image.format,
+            push_constant_ranges: &push_constant_ranges,
+            descriptor_set_layouts: &[self.draft_descriptor_set_layout],
+            line_width: 1.0,
+        };
+
+        let (pipeline, layout) = create_graphics_pipeline(device, &desc)?;
+        self.draft_pipeline = pipeline;
+        self.draft_pipeline_layout = layout;
+
+        // Create draft SDF tile
+        let sdf_spirv = spirv_bytes_to_words(shader_spirv::SDF_GENERATE);
+        let draft_sdf = DraftSdfTile::new(ctx.device, ctx.allocator, &sdf_spirv)?;
+
+        // Write the SDF image into the rendering descriptor set (binding 0) — never changes
+        let img_info = [vk::DescriptorImageInfo::builder()
+            .image_view(draft_sdf.sdf_image.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .build()];
+        let img_writes = [vk::WriteDescriptorSet::builder()
+            .dst_set(self.draft_descriptor_set)
+            .dst_binding(0)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(&img_info)
+            .build()];
+        unsafe {
+            device.update_descriptor_sets(&img_writes, &[] as &[vk::CopyDescriptorSet]);
+        }
+
+        self.draft_sdf = Some(draft_sdf);
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -788,7 +943,6 @@ impl TrafficApp {
         let mut vertices: Vec<LineVertex> = Vec::new();
 
         let road_color = [0.2f32, 0.9, 0.3, 1.0];
-        let pending_color = [1.0f32, 0.9, 0.1, 1.0];
         let cp_color = [1.0f32, 0.2, 0.2, 1.0];
 
         for road_data in &self.network.roads {
@@ -807,28 +961,6 @@ impl TrafficApp {
             }
 
             self.road_draws.push(DrawRange {
-                first_vertex: first,
-                vertex_count: vertices.len() as u32 - first,
-            });
-        }
-
-        if self.pending_points.len() >= 2
-            && let Some(rl) = ReferenceLine::fit(&self.pending_points)
-        {
-            let sample_dist = 1.0;
-            let n_samples = (rl.total_length / sample_dist).ceil() as usize + 1;
-            let first = vertices.len() as u32;
-
-            for i in 0..n_samples {
-                let s = (i as f32 * sample_dist).min(rl.total_length);
-                let pose = rl.evaluate(s);
-                vertices.push(LineVertex {
-                    position: [pose.position.x, pose.position.y],
-                    color: pending_color,
-                });
-            }
-
-            self.pending_draw = Some(DrawRange {
                 first_vertex: first,
                 vertex_count: vertices.len() as u32 - first,
             });
@@ -938,10 +1070,14 @@ impl TrafficApp {
                 self.dirty = true;
                 needs_rebuild = true;
             }
+            self.draft_reference_line = None;
+            self.draft_dirty = false;
         }
 
         if ctx.input.escape_pressed && !self.pending_points.is_empty() {
             self.pending_points.clear();
+            self.draft_reference_line = None;
+            self.draft_dirty = false;
             needs_rebuild = true;
         }
 
@@ -956,6 +1092,39 @@ impl TrafficApp {
                     self.sim_speed = if self.sim_speed == 0.0 { 1.0 } else { 0.0 };
                 }
                 _ => {}
+            }
+        }
+
+        // Draft road preview: build a reference line from pending_points + cursor
+        if !self.pending_points.is_empty() {
+            let cursor_moved = (cursor_world - self.draft_last_cursor).length() > 0.5;
+            if cursor_moved || needs_rebuild {
+                self.draft_last_cursor = cursor_world;
+
+                let mut draft_pts = self.pending_points.clone();
+                draft_pts.push(ControlPoint {
+                    position: cursor_world,
+                    turn_radius: 20.0,
+                    spiral_length: 5.0,
+                });
+
+                if draft_pts.len() >= 2 {
+                    if let Some(rl) = ReferenceLine::fit(&draft_pts) {
+                        // Compute road half-width from default lane config
+                        if let Some(road) = Road::new_with_defaults(draft_pts) {
+                            self.draft_road_half_width = road.total_width_at(0.0) / 2.0;
+                        }
+                        self.draft_reference_line = Some(rl);
+                        self.draft_dirty = true;
+                    }
+                } else {
+                    self.draft_reference_line = None;
+                }
+            }
+        } else {
+            if self.draft_reference_line.is_some() {
+                self.draft_reference_line = None;
+                self.draft_dirty = false;
             }
         }
 
@@ -1176,6 +1345,122 @@ impl TrafficApp {
         }
     }
 
+    fn dispatch_draft_sdf(&mut self, ctx: &EngineContext, cmd: vk::CommandBuffer) {
+        if !self.draft_dirty {
+            return;
+        }
+
+        let rl = match &self.draft_reference_line {
+            Some(rl) => rl,
+            _ => return,
+        };
+
+        // Build segment info from the draft reference line before taking &mut draft_sdf
+        let mut seg_infos = Vec::new();
+        for (seg_idx, seg) in rl.segments.iter().enumerate() {
+            let (seg_type, k_start, k_end) = segment_type_info(seg);
+            seg_infos.push(RoadSegmentInfo {
+                segment_index: seg_idx as u32,
+                road_index: 0,
+                seg_type,
+                origin_x: rl.origins[seg_idx].x,
+                origin_y: rl.origins[seg_idx].y,
+                heading: rl.headings[seg_idx],
+                length: seg.length(),
+                k_start,
+                k_end,
+            });
+        }
+
+        let draft_sdf = match self.draft_sdf.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let device = ctx.device.as_ref();
+
+        // Transition draft SDF image to GENERAL for compute writes
+        let old_layout = draft_sdf.layout;
+        transition_image(
+            device,
+            cmd,
+            draft_sdf.sdf_image.image,
+            old_layout,
+            vk::ImageLayout::GENERAL,
+        );
+
+        if let Err(e) = draft_sdf.update(ctx.device, cmd, &seg_infos) {
+            log::error!("Draft SDF update failed: {e}");
+            return;
+        }
+
+        // Barrier: compute write → fragment read
+        unsafe {
+            let barrier = vk::MemoryBarrier2::builder()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ);
+            let dep = vk::DependencyInfo::builder().memory_barriers(std::slice::from_ref(&barrier));
+            device.cmd_pipeline_barrier2(cmd, &dep);
+        }
+
+        // Transition to SHADER_READ_ONLY for fragment sampling
+        transition_image(
+            device,
+            cmd,
+            draft_sdf.sdf_image.image,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+        draft_sdf.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
+        self.draft_dirty = false;
+    }
+
+    fn draw_draft_road(&self, device: &engine::VkDevice, cmd: vk::CommandBuffer, vp: &glam::Mat4) {
+        let draft_sdf = match &self.draft_sdf {
+            Some(s) if self.draft_reference_line.is_some() => s,
+            _ => return,
+        };
+
+        if draft_sdf.layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            return;
+        }
+
+        unsafe {
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.draft_pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.draft_pipeline_layout,
+                0,
+                &[self.draft_descriptor_set],
+                &[],
+            );
+
+            let pc = DraftPushConstants {
+                view_proj: vp.to_cols_array_2d(),
+                world_origin: draft_sdf.world_origin,
+                world_size: draft_sdf.world_size,
+                road_half_width: self.draft_road_half_width,
+                _pad0: 0.0,
+                _pad1: 0.0,
+                _pad2: 0.0,
+            };
+            device.cmd_push_constants(
+                cmd,
+                self.draft_pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                bytemuck::bytes_of(&pc),
+            );
+
+            // Draw a single quad (6 vertices for 2 triangles)
+            device.cmd_draw(cmd, 6, 1, 0, 0);
+        }
+    }
+
     fn draw_scene(&self, ctx: &EngineContext, cmd: vk::CommandBuffer) {
         let device = ctx.device.as_ref();
 
@@ -1229,6 +1514,7 @@ impl TrafficApp {
             let vp = ctx.camera.view_projection(aspect);
 
             self.draw_road_tiles_indirect(device, cmd, &vp);
+            self.draw_draft_road(device, cmd, &vp);
             self.draw_polylines(device, cmd, &vp);
 
             let car_indirect_buf = self
@@ -1321,10 +1607,6 @@ impl TrafficApp {
                 device.cmd_draw(cmd, draw.vertex_count, 1, draw.first_vertex, 0);
             }
 
-            if let Some(ref draw) = self.pending_draw {
-                device.cmd_draw(cmd, draw.vertex_count, 1, draw.first_vertex, 0);
-            }
-
             if let Some(ref draw) = self.cp_draw {
                 let mut v = draw.first_vertex;
                 let end = draw.first_vertex + draw.vertex_count;
@@ -1393,6 +1675,7 @@ impl App for TrafficApp {
         self.create_grid_pipeline(ctx)?;
         self.create_line_pipeline(ctx)?;
         self.create_sdf_system(ctx)?;
+        self.create_draft_pipeline(ctx)?;
         self.traffic.create_pipelines(ctx)?;
 
         // If a scenario was loaded before init, mark dirty to trigger road upload + car init
@@ -1425,6 +1708,9 @@ impl App for TrafficApp {
         // After a road rebuild, flush all dirty tiles in one go to avoid
         // partially-stale atlas content being visible for multiple frames.
         self.dispatch_sdf(device, cmd, roads_rebuilt);
+
+        // Phase: Draft road SDF generation
+        self.dispatch_draft_sdf(ctx, cmd);
 
         // Phase: Grid background
         self.dispatch_grid(ctx, cmd);
@@ -1492,6 +1778,14 @@ impl App for TrafficApp {
                 .destroy_descriptor_set_layout(self.road_render_descriptor_set_layout, None);
             ctx.device.destroy_sampler(self.road_render_sampler, None);
             ctx.device.destroy_sampler(self.road_id_sampler, None);
+            ctx.device.destroy_pipeline(self.draft_pipeline, None);
+            ctx.device
+                .destroy_pipeline_layout(self.draft_pipeline_layout, None);
+            ctx.device
+                .destroy_descriptor_pool(self.draft_descriptor_pool, None);
+            ctx.device
+                .destroy_descriptor_set_layout(self.draft_descriptor_set_layout, None);
+            ctx.device.destroy_sampler(self.draft_sampler, None);
         }
         if let Some(b) = self.polyline_buffer.take() {
             b.destroy(ctx.allocator);
@@ -1502,6 +1796,9 @@ impl App for TrafficApp {
         self.gpu_road_data.destroy(ctx.allocator);
         if let Some(mut sdf) = self.sdf_manager.take() {
             sdf.destroy(ctx.device.as_ref(), ctx.allocator);
+        }
+        if let Some(mut draft_sdf) = self.draft_sdf.take() {
+            draft_sdf.destroy(ctx.device.as_ref(), ctx.allocator);
         }
         if let Some(mut car_cull) = self.car_cull.take() {
             car_cull.destroy(ctx.device.as_ref(), ctx.allocator);

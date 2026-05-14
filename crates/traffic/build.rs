@@ -118,6 +118,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "traffic_lane_change_main",
             "SHADER_TRAFFIC_LANE_CHANGE",
         ),
+        ("road_draft", "vs_main", "SHADER_ROAD_DRAFT_VS"),
+        ("road_draft", "fs_main", "SHADER_ROAD_DRAFT_FS"),
     ];
 
     // Use no optimization for dev builds, optimized for release.
@@ -158,7 +160,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Validate SPIR-V with spirv-val (catches issues that crash certain drivers)
-        if let Ok(val_output) = Command::new("spirv-val").arg(out_path.to_str().unwrap()).output() {
+        if let Ok(val_output) = Command::new("spirv-val")
+            .arg(out_path.to_str().unwrap())
+            .output()
+        {
             if !val_output.status.success() {
                 let stderr = String::from_utf8_lossy(&val_output.stderr);
                 panic!(
