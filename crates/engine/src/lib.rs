@@ -421,7 +421,7 @@ impl<A: App> ApplicationHandler for EngineRunner<A> {
                     let gfx_queue_family = core.graphics_queue_family();
 
                     // Run egui — app builds its UI here
-                    let full_output = self.egui_ctx.run(egui_input, |egui_ctx| {
+                    let full_output = self.egui_ctx.run_ui(egui_input, |egui_ctx| {
                         let ctx = EngineContext {
                             device: &device_ref,
                             allocator: unsafe { &*allocator_ref },

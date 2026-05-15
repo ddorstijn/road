@@ -438,17 +438,6 @@ impl EguiRenderer {
                 }
                 rgba
             }
-            egui::ImageData::Font(font_image) => {
-                let mut rgba = Vec::with_capacity(font_image.pixels.len() * 4);
-                for &coverage in &font_image.pixels {
-                    let alpha = (coverage * 255.0 + 0.5) as u8;
-                    rgba.push(255); // R
-                    rgba.push(255); // G
-                    rgba.push(255); // B
-                    rgba.push(alpha); // A
-                }
-                rgba
-            }
         }
     }
 

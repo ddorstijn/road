@@ -3,7 +3,7 @@ use std::process::Command;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
-    let shader_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/shaders");
+    let shader_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
     let shader_dir_str = shader_dir.to_str().unwrap();
 
     let shaders: &[(&str, &str, &str)] = &[
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if is_release {
             cmd.arg("-O3");
         } else {
-            cmd.arg("-O0");
+            cmd.args(["-O0", "-g"]);
         }
 
         let output = cmd

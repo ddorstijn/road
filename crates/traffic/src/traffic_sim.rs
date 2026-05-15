@@ -3,7 +3,7 @@ use engine::gpu_resources::GpuBuffer;
 use engine::pipeline::write_storage_buffers;
 use engine::vk::{self, DeviceV1_0, DeviceV1_3, HasBuilder};
 use engine::{ComputePass, EngineContext};
-use rand::Rng;
+use rand::RngExt;
 use road::network::RoadNetwork;
 
 use crate::shader_spirv;
@@ -207,7 +207,12 @@ impl TrafficSim {
         {
             let vs_spirv = spirv_bytes_to_words(shader_spirv::CAR_RENDER_VS);
             let fs_spirv = spirv_bytes_to_words(shader_spirv::CAR_RENDER_FS);
-            self.car_renderer = Some(CarRenderer::new(device, ctx.draw_image.format, &vs_spirv, &fs_spirv)?);
+            self.car_renderer = Some(CarRenderer::new(
+                device,
+                ctx.draw_image.format,
+                &vs_spirv,
+                &fs_spirv,
+            )?);
         }
 
         // Sort: build keys (6 SSBOs)
