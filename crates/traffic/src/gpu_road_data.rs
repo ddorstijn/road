@@ -128,7 +128,9 @@ impl GpuRoadData {
                 lane_section_offset: ls_offset,
                 lane_section_count: road_data.lane_sections.len() as u32,
                 total_length: rl.total_length,
-                _pad: [0; 3],
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             });
         }
 
